@@ -1,5 +1,7 @@
 /**
- * ipyforge-kernel — Pi extension
+ * @johnjanecek/ipyforge-kernel — Pi extension
+ *
+ * Installed via: pi install /path/to/ipython_package
  *
  * Registers 6 custom tools that communicate with a local FastAPI server
  * (ipyforge-kernel-server) wrapping jupyter_client.BlockingKernelClient.
@@ -91,7 +93,7 @@ export default function (pi: ExtensionAPI) {
 		],
 		parameters: Type.Object({
 			connection_file: Type.Optional(
-				Type.String({ description: "Path to kernel.json (e.g., /tmp/agno-kernel.json)" }),
+				Type.String({ description: "Path to kernel.json (e.g., /tmp/remote-kernel.json)" }),
 			),
 			set_default: Type.Optional(
 				Type.Boolean({ description: "Use this connection file for subsequent calls (default: true)" }),

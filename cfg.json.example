@@ -1,0 +1,6 @@
+{
+  "port": 9123,
+  "kernel_connection_file": "/tmp/remote-kernel.json",
+  "max_output_chars": 20000,
+  "default_timeout_s": 30
+}
