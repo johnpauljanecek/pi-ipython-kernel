@@ -16,5 +16,8 @@ build/
 .vscode/
 .idea/
 
+# Workflow docs (internal, not committed)
+workflows/
+
 # Jupyter kernel connection files (runtime artifacts, not committed)
 *.kernel.json
