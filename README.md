@@ -2,6 +2,20 @@
 
 Pi extension for controlling an IPython kernel via HTTP. Execute Python code remotely and interact with a persistent kernel session.
 
+## Prerequisites
+
+This package uses `uv` to manage Python tools. See [docs/uv-tool-env-setup.md](docs/uv-tool-env-setup.md) for a comprehensive guide to setting up a unified IPython/Jupyter environment with `uv tool`.
+
+Quick setup:
+
+```bash
+uv tool install ipython \
+  --with jupyterlab \
+  --with notebook \
+  --with jupyter-console \
+  --with ipykernel
+```
+
 ## Installation
 
 ### 1. Install the Pi package
