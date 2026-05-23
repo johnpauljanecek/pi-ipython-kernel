@@ -416,7 +416,7 @@ jupyter console --existing ~/kernels/dev-kernel.json
 Or using uv explicitly:
 
 ```bash
-uv tool run ipython jupyter console --existing ~/kernels/dev-kernel.json
+uv tool run --from jupyter-console jupyter console --existing ~/kernels/dev-kernel.json
 ```
 
 Now the console is attached to the already-running kernel.
@@ -610,20 +610,24 @@ jupyter lab
 ```bash
 mkdir -p ~/kernels
 
-uv tool run ipython python -m ipykernel \
+uv tool run --from ipython \
+  python -m ipykernel \
   -f ~/kernels/dev-kernel.json
 ```
 
 ## Connect to that kernel
 
 ```bash
-jupyter console --existing ~/kernels/dev-kernel.json
+uv tool run --from jupyter-console jupyter console --existing ~/kernels/dev-kernel.json
 ```
+
+Note: `jupyter console` is provided by `jupyter-console`, not `ipython`.
 
 ## Register as a JupyterLab kernel
 
 ```bash
-uv tool run ipython python -m ipykernel install \
+uv tool run --from ipython \
+  python -m ipykernel install \
   --user \
   --name py313-uv-ipython \
   --display-name "Python 3.13 uv-ipython"
