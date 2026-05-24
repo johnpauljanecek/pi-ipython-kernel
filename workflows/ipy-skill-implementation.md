@@ -4,15 +4,15 @@
 
 | Step | Description | Status |
 |------|-------------|--------|
-| 1 | Install `execa` dependency | Pending |
-| 2 | Update `cfg.json.example` with new fields | Pending |
-| 3 | Update `server/main.py` — read new config fields, internal startup | Pending |
-| 4 | Update config handling in extension — read/write new fields | Pending |
-| 5 | Add `kernel_start` tool — spawn kernel via execa, update cfg.json | Pending |
-| 6 | Update `kernel_connect` tool — two modes (path arg or cfg.json) | Pending |
+| 1 | Install `execa` dependency | Done |
+| 2 | Update `cfg.json.example` with new fields | Done |
+| 3 | Update `server/main.py` — read new config fields, internal startup | N/A |
+| 4 | Update config handling in extension — read/write new fields | Done |
+| 5 | Add `kernel_start` tool — spawn kernel via execa, update cfg.json | Done |
+| 6 | Update `kernel_connect` tool — two modes (path arg or cfg.json) | Done |
 | 7 | Add `kernel_stop` tool — kill Pi-created kernel | Pending |
-| 8 | Update `kernel_status` tool — show kernel + server + auto_created | Pending |
-| 9 | Internal server startup with logging | Pending |
+| 8 | Update `kernel_status` tool — show kernel + server + auto_created | Done |
+| 9 | Internal server startup with logging | Done |
 | 10 | Create `ipy` skill with all tools structured | Pending |
 | 11 | Update `README.md` — reference skill docs | Pending |
 | 12 | Test the complete workflow | Pending |

@@ -3,31 +3,143 @@
  *
  * Installed via: pi install /path/to/ipython_package
  *
- * Registers 6 custom tools that communicate with a local FastAPI server
+ * Registers 7 custom tools that communicate with a local FastAPI server
  * (ipyforge-kernel-server) wrapping jupyter_client.BlockingKernelClient.
  *
- * Server must be running manually on 127.0.0.1:9123.
- * Start it with:  uv run python server/main.py
+ * Server is started internally on first tool call.
+ * Tools use execa to spawn kernel and server processes.
  *
  * Tools:
- *   kernel_connect     — connect to a kernel via its kernel.json file
- *   kernel_run_python  — execute Python code in the kernel
- *   kernel_eval_expr   — evaluate a Python expression
- *   kernel_interrupt   — interrupt the running kernel
- *   kernel_get_output  — retrieve cached output from the last run
- *   kernel_status      — show connection and server state
+ *   kernel_start        — start a new IPython kernel
+ *   kernel_connect      — connect to a kernel via its kernel.json file
+ *   kernel_run_python   — execute Python code in the kernel
+ *   kernel_eval_expr    — evaluate a Python expression
+ *   kernel_interrupt    — interrupt the running kernel
+ *   kernel_get_output   — retrieve cached output from the last run
+ *   kernel_stop         — stop a Pi-created kernel
+ *   kernel_status       — show connection and server state
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { execa } from "execa";
+import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
+import { resolve } from "path";
+import { homedir } from "os";
 
 const SERVER = "http://127.0.0.1:9123";
+const CONFIG_FILENAME = "cfg.json";
 
-/**
- * Call the server endpoint and parse the response.
- * Returns the JSON body on success, or throws a descriptive string on failure.
- */
+// ---------------------------------------------------------------------------
+// Utilities
+// ---------------------------------------------------------------------------
+
+function expandUser(path: string): string {
+	if (path.startsWith("~/")) {
+		return resolve(homedir(), path.slice(2));
+	}
+	return path;
+}
+
+// ---------------------------------------------------------------------------
+// Config
+// ---------------------------------------------------------------------------
+
+interface Config {
+	port: number;
+	kernel_connection_file: string;
+	max_output_chars: number;
+	default_timeout_s: number;
+	default_cwd: string;
+	kernel_auto_created: boolean;
+	kernel_pid: number | null;
+	kernel_log_file: string;
+	server_log_file: string;
+}
+
+function getExtensionDir(): string {
+	// __dirname is the extensions/ directory
+	return resolve(__dirname, "..");
+}
+
+function loadConfig(): Config {
+	const cfgPath = resolve(getExtensionDir(), CONFIG_FILENAME);
+	if (!existsSync(cfgPath)) {
+		return getDefaultConfig();
+	}
+	const raw = JSON.parse(readFileSync(cfgPath, "utf-8")) as Partial<Config>;
+	return getDefaultConfig(raw);
+}
+
+function getDefaultConfig(overrides: Partial<Config> = {}): Config {
+	return {
+		port: 9123,
+		kernel_connection_file: "",
+		max_output_chars: 20000,
+		default_timeout_s: 30,
+		default_cwd: homedir(),
+		kernel_auto_created: false,
+		kernel_pid: null,
+		kernel_log_file: `${homedir()}/.ipy/kernel.log`,
+		server_log_file: `${homedir()}/.ipy/server.log`,
+		...overrides,
+	};
+}
+
+function saveConfig(cfg: Config): void {
+	const cfgPath = resolve(getExtensionDir(), CONFIG_FILENAME);
+	writeFileSync(cfgPath, JSON.stringify(cfg, null, 2), "utf-8");
+}
+
+// ---------------------------------------------------------------------------
+// Server helpers
+// ---------------------------------------------------------------------------
+
+let serverStarted = false;
+
+async function ensureServerRunning(): Promise<void> {
+	if (serverStarted) return;
+
+	const cfg = loadConfig();
+
+	// Ensure log directory exists
+	const logDir = resolve(cfg.server_log_file, "..");
+	if (!existsSync(logDir)) {
+		mkdirSync(logDir, { recursive: true });
+	}
+
+	// Start server using execa
+	await execa("uv", ["run", "python", "server/main.py"], {
+		cwd: getExtensionDir(),
+		stdout: { file: cfg.server_log_file },
+		stderr: { file: cfg.server_log_file },
+	});
+
+	// Wait for server to be ready
+	await new Promise<void>((resolve) => setTimeout(resolve, 1000));
+	serverStarted = true;
+}
+
+// ---------------------------------------------------------------------------
+// Kernel helpers
+// ---------------------------------------------------------------------------
+
+async function waitForKernelFile(path: string, timeoutMs = 5000): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		if (existsSync(path)) return;
+		await new Promise<void>((r) => setTimeout(r, 200));
+	}
+	throw new Error(`Kernel connection file not created within ${timeoutMs}ms`);
+}
+
+// ---------------------------------------------------------------------------
+// Server communication
+// ---------------------------------------------------------------------------
+
 async function serverPost(endpoint: string, body: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
+	await ensureServerRunning();
+
 	const url = `${SERVER}${endpoint}`;
 	let res: Response;
 
@@ -39,7 +151,7 @@ async function serverPost(endpoint: string, body: Record<string, unknown> = {}):
 		});
 	} catch (err) {
 		const msg = err instanceof Error ? err.message : String(err);
-		throw `Cannot reach kernel server at ${SERVER}.\n${msg}\n\nMake sure ipyforge-kernel-server is running:\n  uv run python server/main.py`;
+		throw `Cannot reach kernel server at ${SERVER}.\n${msg}`;
 	}
 
 	const data = (await res.json()) as Record<string, unknown>;
@@ -52,10 +164,9 @@ async function serverPost(endpoint: string, body: Record<string, unknown> = {}):
 	return data;
 }
 
-/**
- * Call a GET endpoint on the server.
- */
 async function serverGet(endpoint: string): Promise<Record<string, unknown>> {
+	await ensureServerRunning();
+
 	const url = `${SERVER}${endpoint}`;
 	let res: Response;
 
@@ -63,7 +174,7 @@ async function serverGet(endpoint: string): Promise<Record<string, unknown>> {
 		res = await fetch(url);
 	} catch (err) {
 		const msg = err instanceof Error ? err.message : String(err);
-		throw `Cannot reach kernel server at ${SERVER}.\n${msg}\n\nMake sure ipyforge-kernel-server is running:\n  uv run python server/main.py`;
+		throw `Cannot reach kernel server at ${SERVER}.\n${msg}`;
 	}
 
 	const data = (await res.json()) as Record<string, unknown>;
@@ -76,24 +187,112 @@ async function serverGet(endpoint: string): Promise<Record<string, unknown>> {
 	return data;
 }
 
+// ---------------------------------------------------------------------------
+// Extension registration
+// ---------------------------------------------------------------------------
+
 export default function (pi: ExtensionAPI) {
 	// -----------------------------------------------------------------------
-	// 1. kernel_connect
+	// 1. kernel_start
+	// -----------------------------------------------------------------------
+	pi.registerTool({
+		name: "kernel_start",
+		label: "Kernel Start",
+		description:
+			"Start a new IPython kernel. " +
+			"Logs are written to the kernel_log_file in cfg.json. " +
+			"User can monitor logs with: tail -f ~/.ipy/kernel.log",
+		promptSnippet: "Start a new IPython kernel",
+		promptGuidelines: [
+			"Use kernel_start to create a new IPython kernel if one is not already running.",
+			"Monitor kernel output with: tail -f ~/.ipy/kernel.log",
+		],
+		parameters: Type.Object({
+			cwd: Type.Optional(
+				Type.String({ description: "Working directory for kernel (default: from cfg.json)" }),
+			),
+		}),
+		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+			try {
+				const cfg = loadConfig();
+				const workingDir = params.cwd ?? cfg.default_cwd;
+
+				// Ensure kernels directory exists
+				const kernelsDir = expandUser("~/kernels");
+				if (!existsSync(kernelsDir)) {
+					mkdirSync(kernelsDir, { recursive: true });
+				}
+
+				// Ensure log directory exists
+				const logDir = resolve(cfg.kernel_log_file, "..");
+				if (!existsSync(logDir)) {
+					mkdirSync(logDir, { recursive: true });
+				}
+
+				// Kernel connection file path
+				const kernelFile = expandUser("~/kernels/ipyforge-kernel.json");
+
+				// Spawn kernel
+				const proc = execa(
+					"uv",
+					["tool", "run", "--from", "ipython", "python", "-m", "ipykernel", "-f", kernelFile],
+					{
+						cwd: workingDir,
+						stdout: { file: cfg.kernel_log_file },
+						stderr: { file: cfg.kernel_log_file },
+					},
+				);
+
+				const pid = proc.pid as number;
+
+				// Wait for kernel file to be created
+				await waitForKernelFile(kernelFile);
+
+				// Update config
+				const updatedCfg: Config = {
+					...cfg,
+					kernel_connection_file: kernelFile,
+					kernel_auto_created: true,
+					kernel_pid: pid,
+				};
+				saveConfig(updatedCfg);
+
+				return {
+					content: [
+						{
+							type: "text",
+							text: `✅ Kernel started with PID ${pid}\nConnection file: ${kernelFile}\nLogs: ${cfg.kernel_log_file}\n\nMonitor output with: tail -f ${cfg.kernel_log_file}`,
+						},
+					],
+					details: { pid, kernel_file: kernelFile },
+				};
+			} catch (err) {
+				return {
+					content: [{ type: "text", text: `❌ ${err}` }],
+					details: {},
+					isError: true,
+				};
+			}
+		},
+	});
+
+	// -----------------------------------------------------------------------
+	// 2. kernel_connect
 	// -----------------------------------------------------------------------
 	pi.registerTool({
 		name: "kernel_connect",
 		label: "Kernel Connect",
 		description:
 			"Connect to an existing IPython kernel via its connection file (kernel.json). " +
-			"If connection_file is omitted, uses the server's configured default. " +
+			"If path is omitted, uses kernel_connection_file from cfg.json. " +
 			"Use this before running code or evaluating expressions.",
 		promptSnippet: "Connect to an IPython kernel",
 		promptGuidelines: [
 			"Use kernel_connect first to establish a connection to a running IPython kernel before using kernel_run_python or kernel_eval_expr.",
 		],
 		parameters: Type.Object({
-			connection_file: Type.Optional(
-				Type.String({ description: "Path to kernel.json (e.g., /tmp/remote-kernel.json)" }),
+			path: Type.Optional(
+				Type.String({ description: "Path to kernel.json (e.g., ~/kernels/my-kernel.json)" }),
 			),
 			set_default: Type.Optional(
 				Type.Boolean({ description: "Use this connection file for subsequent calls (default: true)" }),
@@ -101,10 +300,28 @@ export default function (pi: ExtensionAPI) {
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
 			try {
+				const cfg = loadConfig();
+				const connectionFile = params.path ?? cfg.kernel_connection_file;
+
+				if (!connectionFile) {
+					return {
+						content: [{ type: "text", text: "❌ No kernel connection file specified. Provide path argument or configure kernel_connection_file in cfg.json." }],
+						details: {},
+						isError: true,
+					};
+				}
+
 				const data = await serverPost("/kernel/connect", {
-					connection_file: params.connection_file,
+					connection_file: connectionFile,
 					set_default: params.set_default ?? true,
 				});
+
+				// Update config if path was provided
+				if (params.path && params.set_default !== false) {
+					const updatedCfg: Config = { ...cfg, kernel_connection_file: connectionFile };
+					saveConfig(updatedCfg);
+				}
+
 				return {
 					content: [{ type: "text", text: `✅ Connected to kernel: ${data.connected_file}` }],
 					details: data,
@@ -120,7 +337,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// -----------------------------------------------------------------------
-	// 2. kernel_run_python
+	// 3. kernel_run_python
 	// -----------------------------------------------------------------------
 	pi.registerTool({
 		name: "kernel_run_python",
@@ -166,7 +383,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// -----------------------------------------------------------------------
-	// 3. kernel_eval_expr
+	// 4. kernel_eval_expr
 	// -----------------------------------------------------------------------
 	pi.registerTool({
 		name: "kernel_eval_expr",
@@ -206,7 +423,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// -----------------------------------------------------------------------
-	// 4. kernel_interrupt
+	// 5. kernel_interrupt
 	// -----------------------------------------------------------------------
 	pi.registerTool({
 		name: "kernel_interrupt",
@@ -237,7 +454,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// -----------------------------------------------------------------------
-	// 5. kernel_get_output
+	// 6. kernel_get_output
 	// -----------------------------------------------------------------------
 	pi.registerTool({
 		name: "kernel_get_output",
@@ -285,7 +502,70 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// -----------------------------------------------------------------------
-	// 6. kernel_status
+	// 7. kernel_stop
+	// -----------------------------------------------------------------------
+	pi.registerTool({
+		name: "kernel_stop",
+		label: "Kernel Stop",
+		description:
+			"Stop a kernel that was created by Pi. " +
+			"No-op if the kernel was not auto-created (e.g., user started it manually).",
+		promptSnippet: "Stop the kernel",
+		promptGuidelines: [
+			"Use kernel_stop only to stop a kernel that was started by kernel_start.",
+			"Does nothing if the kernel was not created by Pi.",
+		],
+		parameters: Type.Object({}),
+		async execute(_toolCallId, _params, _signal, _onUpdate, _ctx) {
+			try {
+				const cfg = loadConfig();
+
+				if (!cfg.kernel_auto_created) {
+					return {
+						content: [{ type: "text", text: "ℹ️ Kernel was not created by Pi. Use kernel_stop only for Pi-created kernels." }],
+						details: {},
+					};
+				}
+
+				if (!cfg.kernel_pid) {
+					return {
+						content: [{ type: "text", text: "⚠️ kernel_auto_created is true but kernel_pid is null." }],
+						details: {},
+						isError: true,
+					};
+				}
+
+				// Kill the process
+				try {
+					process.kill(cfg.kernel_pid);
+				} catch {
+					// Process may already be dead
+				}
+
+				// Update config
+				const updatedCfg: Config = {
+					...cfg,
+					kernel_auto_created: false,
+					kernel_pid: null,
+				};
+				saveConfig(updatedCfg);
+
+				return {
+					content: [{ type: "text", text: `✅ Kernel stopped (PID ${cfg.kernel_pid})` }],
+					details: { pid: cfg.kernel_pid },
+				};
+			} catch (err) {
+				return {
+					content: [{ type: "text", text: `❌ ${err}` }],
+					details: {},
+					isError: true,
+				};
+			}
+		},
+	});
+
+	// -----------------------------------------------------------------------
+	// 8. kernel_status
 	// -----------------------------------------------------------------------
 	pi.registerTool({
 		name: "kernel_status",
@@ -300,27 +580,46 @@ export default function (pi: ExtensionAPI) {
 		parameters: Type.Object({}),
 		async execute(_toolCallId, _params, _signal, _onUpdate, _ctx) {
 			try {
-				const data = await serverGet("/kernel/status") as {
-					connected: boolean;
-					connection_file: string;
-					port: number;
-				};
+				const cfg = loadConfig();
+
+				let serverRunning = false;
+				try {
+					await fetch(`${SERVER}/health`);
+					serverRunning = true;
+				} catch {
+					serverRunning = false;
+				}
+
+				let kernelConnected = false;
+				if (cfg.kernel_connection_file) {
+					try {
+						const data = await serverGet("/kernel/status") as { connected: boolean };
+						kernelConnected = data.connected;
+					} catch {
+						kernelConnected = false;
+					}
+				}
 
 				const lines: string[] = [];
-				lines.push(`🔌 Kernel server port: ${data.port}`);
-				lines.push(`📁 Connection file: ${data.connection_file || "(not set)"}`);
-				lines.push(`🔗 Connected: ${data.connected ? "✅ yes" : "❌ no"}`);
+				lines.push(`🔌 Server: ${serverRunning ? "✅ running" : "❌ not running"}`);
+				lines.push(`🔗 Kernel: ${kernelConnected ? "✅ connected" : "❌ not connected"}`);
+				lines.push(`📁 Connection file: ${cfg.kernel_connection_file || "(not set)"}`);
+				lines.push(`🤖 Auto-created: ${cfg.kernel_auto_created ? "yes" : "no"}`);
+				if (cfg.kernel_pid) {
+					lines.push(` PID: ${cfg.kernel_pid}`);
+				}
+				lines.push(`📝 Log files:`);
+				lines.push(`   Kernel: ${cfg.kernel_log_file}`);
+				lines.push(`   Server: ${cfg.server_log_file}`);
 
-				if (!data.connected && data.connection_file) {
+				if (!kernelConnected && cfg.kernel_connection_file) {
 					lines.push("");
-					lines.push("⚠️  Not connected. Make sure the kernel is running:");
-					lines.push("   uv run ipython kernel --profile=agno -f <connection_file>");
-					lines.push("   Then use kernel_connect to connect.");
+					lines.push("⚠️  Not connected. Make sure the kernel is running.");
 				}
 
 				return {
 					content: [{ type: "text", text: lines.join("\n") }],
-					details: data,
+					details: { serverRunning, kernelConnected, ...cfg },
 				};
 			} catch (err) {
 				return {
