@@ -5,10 +5,9 @@ FastAPI server that wraps jupyter_client.BlockingKernelClient.
 Connects to an already-running IPython kernel via its kernel.json file.
 
 Usage:
-    cd /path/to/ipython_extension
     uv run python server/main.py
 
-Config read from ./cfg.json (working directory at startup).
+Config read from cfg.json in the package root (alongside server/).
 """
 
 from __future__ import annotations
@@ -103,7 +102,9 @@ def _truncate(text: str, max_chars: int) -> str:
 # FastAPI app
 # ---------------------------------------------------------------------------
 
-config: ServerConfig = load_config()
+# Resolve cfg.json relative to the package root (server/main.py -> parent dir)
+_pkg_root = Path(__file__).resolve().parent.parent
+config: ServerConfig = load_config(str(_pkg_root))
 _last_output_full: str = ""
 _last_output_lock = threading.Lock()
 
