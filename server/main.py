@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 import uvicorn
+import zmq
 from fastapi import FastAPI, HTTPException
 from jupyter_client import BlockingKernelClient, KernelManager
 from pydantic import BaseModel
@@ -39,6 +40,7 @@ class ServerConfig:
     kernel_connection_file: str = ""
     max_output_chars: int = 20000
     default_timeout_s: float = 30.0
+    kernel_channel_timeout_s: float = 5.0
 
 
 def load_config(cwd: str | None = None) -> ServerConfig:
@@ -54,6 +56,7 @@ def load_config(cwd: str | None = None) -> ServerConfig:
         kernel_connection_file=str(raw.get("kernel_connection_file", "")),
         max_output_chars=int(raw.get("max_output_chars", 20000)),
         default_timeout_s=float(raw.get("default_timeout_s", 30.0)),
+        kernel_channel_timeout_s=float(raw.get("kernel_channel_timeout_s", 5.0)),
     )
 
 
@@ -73,7 +76,15 @@ def _connect(path: str) -> BlockingKernelClient:
     info = _load_connection_info(path)
     c = BlockingKernelClient()
     c.load_connection_info(info)
+    channel_timeout = int(config.kernel_channel_timeout_s)
     c.start_channels()
+    # Set timeouts on ZMQ channels so we don't hang on a dead kernel
+    timeout_ms = channel_timeout * 1000
+    for ch_name in ("shell", "control", "iopub", "stdin"):
+        ch = getattr(c, f"{ch_name}_channel", None)
+        if ch is not None:
+            ch.socket.setsockopt(zmq.RCVTIMEO, timeout_ms)
+            ch.socket.setsockopt(zmq.SNDTIMEO, timeout_ms)
     try:
         c.kernel_info()  # verify the kernel is alive
     except Exception as exc:

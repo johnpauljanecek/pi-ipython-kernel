@@ -29,6 +29,8 @@ import { homedir } from "os";
 
 const SERVER = "http://127.0.0.1:9123";
 const CONFIG_FILENAME = "cfg.json";
+const REQUEST_TIMEOUT_MS = 10_000;
+const SERVER_START_TIMEOUT_MS = 15_000;
 
 // ---------------------------------------------------------------------------
 // Utilities
@@ -98,7 +100,15 @@ function saveConfig(cfg: Config): void {
 let serverStarted = false;
 
 async function ensureServerRunning(): Promise<void> {
-	if (serverStarted) return;
+	if (serverStarted) {
+		// Verify it's still reachable — if not, reset and restart
+		try {
+			await fetch(`${SERVER}/health`, { signal: AbortSignal.timeout(2000) });
+			return;
+		} catch {
+			serverStarted = false;
+		}
+	}
 
 	const cfg = loadConfig();
 
@@ -109,15 +119,24 @@ async function ensureServerRunning(): Promise<void> {
 	}
 
 	// Start server using execa
-	await execa("uv", ["run", "python", "server/main.py"], {
+	execa("uv", ["run", "python", "server/main.py"], {
 		cwd: getExtensionDir(),
 		stdout: { file: cfg.server_log_file },
 		stderr: { file: cfg.server_log_file },
 	});
 
-	// Wait for server to be ready
-	await new Promise<void>((resolve) => setTimeout(resolve, 1000));
-	serverStarted = true;
+	// Poll health endpoint until ready or timeout
+	const deadline = Date.now() + SERVER_START_TIMEOUT_MS;
+	while (Date.now() < deadline) {
+		try {
+			await fetch(`${SERVER}/health`, { signal: AbortSignal.timeout(1000) });
+			serverStarted = true;
+			return;
+		} catch {
+			await new Promise<void>((r) => setTimeout(r, 300));
+		}
+	}
+	throw `Server failed to start within ${SERVER_START_TIMEOUT_MS}ms. Check ${cfg.server_log_file}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -148,6 +167,7 @@ async function serverPost(endpoint: string, body: Record<string, unknown> = {}):
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify(body),
+			signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
 		});
 	} catch (err) {
 		const msg = err instanceof Error ? err.message : String(err);
@@ -171,7 +191,7 @@ async function serverGet(endpoint: string): Promise<Record<string, unknown>> {
 	let res: Response;
 
 	try {
-		res = await fetch(url);
+		res = await fetch(url, { signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
 	} catch (err) {
 		const msg = err instanceof Error ? err.message : String(err);
 		throw `Cannot reach kernel server at ${SERVER}.\n${msg}`;
@@ -185,6 +205,10 @@ async function serverGet(endpoint: string): Promise<Record<string, unknown>> {
 	}
 
 	return data;
+}
+
+async function fetchWithTimeout(url: string, timeoutMs: number = REQUEST_TIMEOUT_MS): Promise<Response> {
+	return fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
 }
 
 // ---------------------------------------------------------------------------
@@ -584,7 +608,7 @@ export default function (pi: ExtensionAPI) {
 
 				let serverRunning = false;
 				try {
-					await fetch(`${SERVER}/health`);
+					await fetchWithTimeout(`${SERVER}/health`, 3000);
 					serverRunning = true;
 				} catch {
 					serverRunning = false;
