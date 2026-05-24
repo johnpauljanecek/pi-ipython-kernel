@@ -13,9 +13,9 @@
 | 7 | Add `kernel_stop` tool — kill Pi-created kernel | Pending |
 | 8 | Update `kernel_status` tool — show kernel + server + auto_created | Done |
 | 9 | Internal server startup with logging | Done |
-| 10 | Create `ipy` skill with all tools structured | Pending |
-| 11 | Update `README.md` — reference skill docs | Pending |
-| 12 | Test the complete workflow | Pending |
+| 10 | Create `ipy` skill with all tools structured | Done |
+| 11 | Update `README.md` — reference skill docs | Done |
+| 12 | Test the complete workflow | Done |
 | 13 | Validate and commit | Pending |
 
 ---
