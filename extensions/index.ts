@@ -23,7 +23,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { execa } from "execa";
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync } from "fs";
 import { resolve } from "path";
 import { homedir } from "os";
 
@@ -99,6 +99,7 @@ function saveConfig(cfg: Config): void {
 
 let serverStarted = false;
 let serverProcess: ReturnType<typeof execa> | null = null;
+let kernelProcess: ReturnType<typeof execa> | null = null;
 
 async function killStaleServer(port: number): Promise<void> {
 	// Kill the tracked process if we have one
@@ -284,9 +285,15 @@ export default function (pi: ExtensionAPI) {
 				// Kernel connection file path
 				const kernelFile = expandUser("~/kernels/ipyforge-kernel.json");
 
-				// Spawn kernel
+				// Kill any previously tracked kernel process
+				if (kernelProcess) {
+					try { kernelProcess.kill(); } catch { /* already dead */ }
+					kernelProcess = null;
+				}
+
+				// Spawn kernel and track the process
 				let spawnError: string | null = null;
-				const proc = execa(
+				kernelProcess = execa(
 					"uv",
 					["tool", "run", "--from", "ipython", "python", "-m", "ipykernel", "-f", kernelFile],
 					{
@@ -295,17 +302,18 @@ export default function (pi: ExtensionAPI) {
 						stderr: { file: cfg.kernel_log_file },
 					},
 				);
-				proc.catch((err) => {
+				kernelProcess.catch((err) => {
 					spawnError = err instanceof Error ? err.message : String(err);
 				});
 
-				const pid = proc.pid as number;
+				const pid = kernelProcess.pid as number;
 
 				// Wait for kernel file to be created
 				await waitForKernelFile(kernelFile);
 
 				// Verify process is still alive (didn't crash on startup)
 				if (spawnError) {
+					kernelProcess = null;
 					throw `Kernel process exited during startup: ${spawnError}. Check ${cfg.kernel_log_file}`;
 				}
 
@@ -596,11 +604,42 @@ export default function (pi: ExtensionAPI) {
 					};
 				}
 
-				// Kill the process
+				const savedPid = cfg.kernel_pid;
+				const kernelFile = cfg.kernel_connection_file;
+				let shutdownMethod = "process kill";
+
+				// 1. Try graceful shutdown via the kernel's control channel
 				try {
-					process.kill(cfg.kernel_pid);
+					await serverPost("/kernel/shutdown");
+					shutdownMethod = "graceful shutdown";
+					// Give the kernel a moment to exit cleanly
+					await new Promise<void>((r) => setTimeout(r, 500));
 				} catch {
-					// Process may already be dead
+					// Server or kernel not reachable — fall through to process kill
+				}
+
+				// 2. Kill the tracked kernel process if we have it
+				if (kernelProcess) {
+					try { kernelProcess.kill(); } catch { /* already dead */ }
+					kernelProcess = null;
+				}
+
+				// 3. Kill the process group to catch any child Python process
+				try {
+					process.kill(-savedPid);
+				} catch {
+					// Process group may not exist — try individual PID
+					try { process.kill(savedPid); } catch { /* already dead */ }
+				}
+
+				// 4. Clean up the kernel connection file
+				if (kernelFile) {
+					try {
+						const expanded = expandUser(kernelFile);
+						if (existsSync(expanded)) {
+							unlinkSync(expanded);
+						}
+					} catch { /* file may not exist or permissions issue */ }
 				}
 
 				// Update config
@@ -612,8 +651,8 @@ export default function (pi: ExtensionAPI) {
 				saveConfig(updatedCfg);
 
 				return {
-					content: [{ type: "text", text: `✅ Kernel stopped (PID ${cfg.kernel_pid})` }],
-					details: { pid: cfg.kernel_pid },
+					content: [{ type: "text", text: `✅ Kernel stopped (PID ${savedPid}, ${shutdownMethod})` }],
+					details: { pid: savedPid, method: shutdownMethod },
 				};
 			} catch (err) {
 				return {

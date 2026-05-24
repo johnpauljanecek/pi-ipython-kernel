@@ -147,6 +147,11 @@ class InterruptResponse(BaseModel):
     interrupted: bool
 
 
+class ShutdownResponse(BaseModel):
+    shutdown: bool
+    pid_killed: bool = False
+
+
 class GetOutputRequest(BaseModel):
     start: int = 0
     limit: int = 4000
@@ -333,6 +338,30 @@ async def kernel_interrupt():
         return InterruptResponse(interrupted=True)
     except Exception as e:
         raise HTTPException(502, detail=f"Interrupt failed: {e}")
+    finally:
+        try:
+            client.stop_channels()
+        except Exception:
+            pass
+
+
+@app.post("/kernel/shutdown", response_model=ShutdownResponse)
+async def kernel_shutdown():
+    """Send a shutdown_request via the control channel to stop the kernel cleanly."""
+    path = config.kernel_connection_file
+    if not path:
+        raise HTTPException(400, detail="No kernel connection file configured. Call /kernel/connect first.")
+
+    try:
+        client = _connect(path)
+    except (FileNotFoundError, RuntimeError, Exception) as e:
+        raise HTTPException(502, detail=str(e))
+
+    try:
+        client.shutdown(restart=False)
+        return ShutdownResponse(shutdown=True)
+    except Exception as e:
+        raise HTTPException(502, detail=f"Shutdown failed: {e}")
     finally:
         try:
             client.stop_channels()
