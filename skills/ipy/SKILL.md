@@ -87,7 +87,13 @@ For large output:
 ```
 kernel_run_python { "code": "..." }
 kernel_get_output { "start": 0, "limit": 4000 }
-kernel_get_output { "start": 4000, "limit": 4000 }
+```
+
+**Example tool call:**
+```
+kernel_run_python {
+  "code": "def hanoi(n, source=\"A\", target=\"C\", auxiliary=\"B\"):\n    if n == 1:\n        print(f\"Move disk 1 from {source} to {target}\")\n        return\n    hanoi(n - 1, source, auxiliary, target)\n    print(f\"Move disk {n} from {source} to {target}\")\n    hanoi(n - 1, auxiliary, target, source)\n\nprint(\"Towers of Hanoi - 3 disks:\")\nhanoi(3)"
+}
 ```
 
 ### Quick expression eval
