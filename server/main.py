@@ -23,7 +23,7 @@ from typing import Any, Optional
 
 import uvicorn
 from fastapi import FastAPI, HTTPException
-from jupyter_client import BlockingKernelClient
+from jupyter_client import BlockingKernelClient, KernelManager
 from pydantic import BaseModel
 
 # ---------------------------------------------------------------------------
@@ -305,7 +305,7 @@ async def kernel_eval_expr(req: EvalExprRequest):
 
 @app.post("/kernel/interrupt", response_model=InterruptResponse)
 async def kernel_interrupt():
-    """Interrupt the running kernel (sends SIGINT)."""
+    """Interrupt the running kernel (sends SIGINT via control channel)."""
     path = config.kernel_connection_file
     if not path:
         raise HTTPException(400, detail="No kernel connection file configured. Call /kernel/connect first.")
@@ -316,7 +316,9 @@ async def kernel_interrupt():
         raise HTTPException(502, detail=str(e))
 
     try:
-        client.interrupt_kernel()
+        # Use blocking client's session to construct interrupt message via control channel
+        msg = client.session.msg("interrupt_request")
+        client.control_channel.send(msg)
         return InterruptResponse(interrupted=True)
     except Exception as e:
         raise HTTPException(502, detail=f"Interrupt failed: {e}")
