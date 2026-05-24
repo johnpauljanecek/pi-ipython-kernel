@@ -103,20 +103,19 @@ could change this.
 
 ---
 
-## BUG-07: Redundant kernel connection check in `kernel_status`
+## ~~BUG-07: Redundant kernel connection check in `kernel_status`~~ ✅ RESOLVED
 
 **Severity:** Low  
-**File:** `extensions/index.ts` (kernel_status handler)
+**File:** `extensions/index.ts` (kernel_status handler)  
+**Commit:** `5b3bcf1`
 
-The extension's `kernel_status` tool calls `serverGet("/kernel/status")` which
-internally connects to the kernel via ZMQ to verify aliveness. But the handler
-also makes a separate `fetchWithTimeout("/health")` call before that. Both
-checks are against the same server — the health check is redundant if the
-status endpoint is about to be called anyway.
+The extension's `kernel_status` tool called a separate `fetchWithTimeout("/health")`
+before calling `serverGet("/kernel/status")`. Both checks hit the same server —
+the health check was redundant. Also removed the now-unused `fetchWithTimeout`
+helper.
 
-**Fix:** Remove the separate health check `fetch`. The `serverGet("/kernel/status")`
-call will fail fast with a timeout if the server is unreachable, and the catch
-block already handles that.
+**Resolution:** Single `serverGet("/kernel/status")` call derives both
+`serverRunning` and `kernelConnected`.
 
 ---
 
