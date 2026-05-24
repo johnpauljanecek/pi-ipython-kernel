@@ -88,17 +88,18 @@ intended to be versioned.
 
 ---
 
-## BUG-06: `pydantic` missing from `pyproject.toml` dependencies
+## ~~BUG-06: `pydantic` missing from `pyproject.toml` dependencies~~ ✅ RESOLVED
 
 **Severity:** Low  
-**File:** `pyproject.toml`
+**File:** `pyproject.toml`  
+**Commit:** `03c2127`
 
 `server/main.py` imports `from pydantic import BaseModel`, but `pydantic` is
 not listed under `[project].dependencies`. It currently works because FastAPI
 pulls it as a transitive dependency, but that's fragile — a FastAPI update
 could change this.
 
-**Fix:** Add `"pydantic>=2.0.0"` to `dependencies` in `pyproject.toml`.
+**Resolution:** Added `pydantic>=2.0.0` and `pyzmq>=25.0.0` to dependencies.
 
 ---
 
