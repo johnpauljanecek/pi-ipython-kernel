@@ -21,3 +21,12 @@ workflows/
 
 # Jupyter kernel connection files (runtime artifacts, not committed)
 *.kernel.json
+
+# Pi runtime artifacts
+.pi/
+
+# Node / npm
+node_modules/
+
+# User config (runtime state with personal paths)
+cfg.json
