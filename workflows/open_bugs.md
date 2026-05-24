@@ -119,20 +119,19 @@ helper.
 
 ---
 
-## BUG-08: `cfg.json` still referenced in `server/main.py` main() startup message
+## ~~BUG-08: Server cwd-dependent config loading~~ ✅ RESOLVED
 
 **Severity:** Low  
-**File:** `server/main.py` (`main()`)
+**File:** `server/main.py`  
+**Commit:** `e2fa931`
 
-The server's startup message prints the kernel connection file path, which is
-sourced from `cfg.json` at the server's working directory. If the server is
-started by the extension (cwd = package root), it reads the right config. But
-if someone starts the server manually from a different directory, the config
-won't be found and the server will use defaults with no kernel connection file
-— all kernel operations will fail with a confusing error.
+The server's `load_config()` used `os.getcwd()` to find `cfg.json`. If the
+server was started from a different directory, it wouldn't find the config
+and would use defaults with no kernel connection file.
 
-**Fix:** Accept a `--config` CLI argument or use the package directory as the
-config search path.
+**Resolution:** Config path now derived from `__file__`
+(`Path(__file__).resolve().parent.parent`) — always the package root,
+regardless of cwd.
 
 ---
 
