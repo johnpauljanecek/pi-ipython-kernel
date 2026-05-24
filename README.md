@@ -1,115 +1,103 @@
-# @johnjanecek/ipyforge-kernel
+# ipyforge-kernel
 
-Pi extension for controlling an IPython kernel via HTTP. Execute Python code remotely and interact with a persistent kernel session.
-
-## Prerequisites
-
-This package uses `uv` to manage Python tools. See [docs/uv-tool-env-setup.md](docs/uv-tool-env-setup.md) for a comprehensive guide to setting up a unified IPython/Jupyter environment with `uv tool`.
-
-Quick setup:
-
-```bash
-uv tool install ipython \
-  --with jupyterlab \
-  --with notebook \
-  --with jupyter-console \
-  --with ipykernel
-```
+Pi extension for controlling an IPython kernel via HTTP. Communicates with a FastAPI server that wraps `jupyter_client.BlockingKernelClient`.
 
 ## Installation
 
-### 1. Install the Pi package
+### From npm (once published)
+```bash
+pi install npm:@johnjanecek/ipyforge-kernel
+```
+
+### From GitHub
+```bash
+pi install git:github.com/johnjanecek/ipyforge-kernel
+```
+
+### From local path
+```bash
+pi install /path/to/ipython_package
+```
+
+### Try without installing
+```bash
+pi -e npm:@johnjanecek/ipyforge-kernel
+pi -e git:github.com/johnjanecek/ipyforge-kernel
+```
+
+## Tools
+
+| Tool | Description |
+|------|-------------|
+| `kernel_start` | Start a new IPython kernel |
+| `kernel_connect` | Connect to a kernel (path argument or cfg.json) |
+| `kernel_run_python` | Execute Python code in the kernel |
+| `kernel_eval_expr` | Evaluate a Python expression |
+| `kernel_interrupt` | Interrupt a stuck kernel |
+| `kernel_get_output` | Retrieve cached output slices |
+| `kernel_stop` | Stop a Pi-created kernel |
+| `kernel_status` | Show server and kernel status |
+
+## Quick Start
+
+### 1. Install IPython tool
+
+```bash
+uv tool install ipython --with ipykernel --with jupyter-console
+```
+
+### 2. Install this package
 
 ```bash
 pi install /path/to/ipython_package
 ```
 
-Or for development:
+### 3. Start a kernel
 
-```bash
-pi -e /path/to/ipython_package
+```
+kernel_start
 ```
 
-### 2. Install server dependencies
+### 4. Connect and run code
 
-```bash
-cd /path/to/ipython_package
-uv sync
+```
+kernel_connect
+kernel_run_python { "code": "print('hello from kernel')" }
 ```
 
-### 3. Configure the server
+## Server Setup
 
-Copy the example config:
+The server starts internally on first tool call. Log output goes to:
+- Kernel: `~/.ipy/kernel.log`
+- Server: `~/.ipy/server.log`
 
+Monitor with:
 ```bash
-cp cfg.json.example cfg.json
+tail -f ~/.ipy/kernel.log
 ```
 
-Edit `cfg.json` to point to your kernel connection file:
+## Configuration
+
+Create `cfg.json` in the package root (see `cfg.json.example`):
 
 ```json
 {
   "port": 9123,
-  "kernel_connection_file": "/tmp/remote-kernel.json"
+  "kernel_connection_file": "~/kernels/ipyforge-kernel.json",
+  "default_cwd": "/Users/johnjanecek",
+  "kernel_log_file": "~/.ipy/kernel.log",
+  "server_log_file": "~/.ipy/server.log"
 }
 ```
 
-### 4. Start the kernel (remote access)
+## Documentation
 
-Create an IPython profile (one time):
+- [uv tool environment setup](docs/uv-tool-env-setup.md)
+- [Kitty remote control](docs/useful_kitty.md)
+- [ipy skill](skills/ipy/SKILL.md)
 
-```bash
-uv run ipython profile create pi-dev
-```
+## Requirements
 
-Start the kernel, binding to all interfaces:
-
-```bash
-uv run ipython kernel --profile=pi-dev --ip=0.0.0.0 -f /tmp/remote-kernel.json
-```
-
-Copy the connection file (`/tmp/remote-kernel.json`) to the machine running the server, then update `cfg.json` with the path.
-
-### 5. Start the server
-
-```bash
-cd /path/to/ipython_package
-uv run python server/main.py
-```
-
-### 6. Reload Pi
-
-Run `/reload` in Pi to pick up the new extension.
-
-## Available Tools
-
-| Tool | Description |
-|------|-------------|
-| `kernel_connect` | Connect to a kernel via its connection file |
-| `kernel_run_python` | Execute Python code in the kernel |
-| `kernel_eval_expr` | Evaluate a Python expression |
-| `kernel_interrupt` | Interrupt a running kernel |
-| `kernel_get_output` | Retrieve cached output (when truncated) |
-| `kernel_status` | Show connection and server status |
-
-## Quick Start
-
-1. Start the server: `uv run python server/main.py`
-2. In Pi, use `kernel_connect` to connect to the kernel
-3. Use `kernel_run_python` to execute Python code
-
-## Connect with jupyter console
-
-On the same machine as the kernel:
-
-```bash
-uv run jupyter console --existing /tmp/remote-kernel.json
-```
-
-From a different machine, edit the `ip` field in the copied `kernel.json` first.
-
-## Uninstall
-
-```bash
-pi remove /path/to/ipython_package
-```
+- `uv` installed
+- `ipython` tool installed with `ipykernel` and `jupyter-console`
+- Python: `fastapi`, `uvicorn`, `jupyter_client`, `pydantic`
