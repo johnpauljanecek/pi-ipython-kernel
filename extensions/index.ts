@@ -243,10 +243,6 @@ async function serverGet(endpoint: string): Promise<Record<string, unknown>> {
 	return data;
 }
 
-async function fetchWithTimeout(url: string, timeoutMs: number = REQUEST_TIMEOUT_MS): Promise<Response> {
-	return fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
-}
-
 // ---------------------------------------------------------------------------
 // Extension registration
 // ---------------------------------------------------------------------------
@@ -690,21 +686,13 @@ export default function (pi: ExtensionAPI) {
 				const cfg = loadConfig();
 
 				let serverRunning = false;
-				try {
-					await fetchWithTimeout(`${SERVER}/health`, 3000);
-					serverRunning = true;
-				} catch {
-					serverRunning = false;
-				}
-
 				let kernelConnected = false;
-				if (cfg.kernel_connection_file) {
-					try {
-						const data = await serverGet("/kernel/status") as { connected: boolean };
-						kernelConnected = data.connected;
-					} catch {
-						kernelConnected = false;
-					}
+				try {
+					const data = await serverGet("/kernel/status") as { connected: boolean };
+					serverRunning = true;
+					kernelConnected = data.connected;
+				} catch {
+					// Server unreachable — both remain false
 				}
 
 				const lines: string[] = [];
