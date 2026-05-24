@@ -56,10 +56,11 @@ only the wrapper may leave:
 
 ---
 
-## BUG-04: User-provided `~` paths in cfg.json are never expanded
+## ~~BUG-04: User-provided `~` paths in cfg.json are never expanded~~ ✅ RESOLVED
 
 **Severity:** Medium  
-**File:** `extensions/index.ts` (`loadConfig`)
+**File:** `extensions/index.ts` (`loadConfig`)  
+**Commit:** `05f420c`
 
 `loadConfig()` reads path fields (`kernel_connection_file`, `kernel_log_file`,
 `server_log_file`, `default_cwd`) from JSON but never calls `expandUser()` on
@@ -67,8 +68,8 @@ them. The defaults work because `getDefaultConfig` uses `${homedir()}/...`, but
 if a user writes `~/kernels/my-kernel.json` in `cfg.json`, the `~` is treated
 literally as a filename character.
 
-**Fix:** Run `expandUser()` on all path fields in `loadConfig()` before
-returning.
+**Resolution:** `loadConfig()` now iterates over the four path fields and calls
+`expandUser()` on each before passing to `getDefaultConfig()`.
 
 ---
 
