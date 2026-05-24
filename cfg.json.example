@@ -1,6 +1,11 @@
 {
   "port": 9123,
-  "kernel_connection_file": "/tmp/remote-kernel.json",
+  "kernel_connection_file": "/Users/johnjanecek/kernels/ipyforge-kernel.json",
   "max_output_chars": 20000,
-  "default_timeout_s": 30
+  "default_timeout_s": 30,
+  "default_cwd": "/Users/johnjanecek",
+  "kernel_auto_created": false,
+  "kernel_pid": null,
+  "kernel_log_file": "/Users/johnjanecek/.ipy/kernel.log",
+  "server_log_file": "/Users/johnjanecek/.ipy/server.log"
 }
