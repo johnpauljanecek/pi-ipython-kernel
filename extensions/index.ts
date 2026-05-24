@@ -98,6 +98,27 @@ function saveConfig(cfg: Config): void {
 // ---------------------------------------------------------------------------
 
 let serverStarted = false;
+let serverProcess: ReturnType<typeof execa> | null = null;
+
+async function killStaleServer(port: number): Promise<void> {
+	// Kill the tracked process if we have one
+	if (serverProcess) {
+		try { serverProcess.kill(); } catch { /* already dead */ }
+		serverProcess = null;
+	}
+	// Kill any process already listening on the server port
+	try {
+		const { stdout } = await execa("lsof", ["-ti", `:${port}`], { reject: false });
+		const pids = stdout.trim();
+		if (pids) {
+			for (const pid of pids.split("\n")) {
+				try { process.kill(Number(pid)); } catch { /* already dead */ }
+			}
+			// Brief wait for the port to free up
+			await new Promise<void>((r) => setTimeout(r, 500));
+		}
+	} catch { /* lsof not available or no match */ }
+}
 
 async function ensureServerRunning(): Promise<void> {
 	if (serverStarted) {
@@ -112,17 +133,24 @@ async function ensureServerRunning(): Promise<void> {
 
 	const cfg = loadConfig();
 
+	// Kill any stale server (from previous session or tracked process)
+	await killStaleServer(cfg.port);
+
 	// Ensure log directory exists
 	const logDir = resolve(cfg.server_log_file, "..");
 	if (!existsSync(logDir)) {
 		mkdirSync(logDir, { recursive: true });
 	}
 
-	// Start server using execa
-	execa("uv", ["run", "python", "server/main.py"], {
+	// Start server and track the process
+	serverProcess = execa("uv", ["run", "python", "server/main.py"], {
 		cwd: getExtensionDir(),
 		stdout: { file: cfg.server_log_file },
 		stderr: { file: cfg.server_log_file },
+	});
+	serverProcess.catch(() => {
+		serverStarted = false;
+		serverProcess = null;
 	});
 
 	// Poll health endpoint until ready or timeout
