@@ -22,28 +22,34 @@ Pi skill for controlling an IPython kernel via HTTP. The extension communicates 
 
 ## Configuration
 
-Configuration is in `cfg.json` in the package root:
+Configuration is in `cfg.json` in the package root. Use `~/` paths — they are automatically expanded.
 
 ```json
 {
   "port": 9123,
-  "kernel_connection_file": "/Users/johnjanecek/kernels/ipyforge-kernel.json",
-  "default_cwd": "/Users/johnjanecek",
+  "kernel_connection_file": "~/kernels/ipyforge-kernel.json",
+  "max_output_chars": 20000,
+  "default_timeout_s": 30,
+  "kernel_channel_timeout_s": 5,
+  "default_cwd": "~/",
   "kernel_auto_created": false,
   "kernel_pid": null,
-  "kernel_log_file": "/Users/johnjanecek/.ipy/kernel.log",
-  "server_log_file": "/Users/johnjanecek/.ipy/server.log"
+  "kernel_log_file": "~/.ipy/kernel.log",
+  "server_log_file": "~/.ipy/server.log"
 }
 ```
 
 **Fields**:
 - `port` — server port (default: 9123)
-- `kernel_connection_file` — path to kernel connection file
-- `default_cwd` — working directory for starting kernels
+- `kernel_connection_file` — path to kernel connection file (`~` expanded)
+- `max_output_chars` — max chars before output truncation (default: 20000)
+- `default_timeout_s` — default timeout for code execution (default: 30)
+- `kernel_channel_timeout_s` — ZMQ socket timeout for kernel communication (default: 5)
+- `default_cwd` — working directory for starting kernels (`~` expanded)
 - `kernel_auto_created` — whether Pi created the kernel (true = can stop, false = user-created)
 - `kernel_pid` — process ID if Pi created the kernel
-- `kernel_log_file` — kernel stdout/stderr log
-- `server_log_file` — server stdout/stderr log
+- `kernel_log_file` — kernel stdout/stderr log (`~` expanded)
+- `server_log_file` — server stdout/stderr log (`~` expanded)
 
 ## Workflow
 
@@ -130,6 +136,14 @@ kernel_stop
 
 Only works for Pi-created kernels. No-op for user-created kernels.
 
+Shuts down in four stages:
+1. Graceful Jupyter shutdown via control channel
+2. Kill tracked kernel process
+3. Kill process group (catches child Python processes)
+4. Clean up kernel connection file
+
+The shutdown method is reported in the output (`graceful shutdown` or `process kill`).
+
 ## Log Monitoring
 
 Both kernel and server output are written to log files. Monitor with:
@@ -148,7 +162,7 @@ The user is responsible for monitoring logs. If execution fails, check the log f
 
 - `uv` installed and available in PATH
 - `ipython` tool installed via `uv tool install ipython --with ipykernel`
-- Python packages: `fastapi`, `uvicorn`, `jupyter_client`, `pydantic`
+- Python packages: `fastapi`, `uvicorn`, `jupyter_client`, `ipykernel`, `jupyter_console`, `pydantic`, `pyzmq`
 
 Install IPython tool environment:
 
@@ -157,6 +171,14 @@ uv tool install ipython \
   --with ipykernel \
   --with jupyter-console
 ```
+
+## Timeout Protection
+
+All HTTP requests to the server use a 10-second timeout via `AbortSignal`. If the server
+is unreachable, tools fail fast instead of hanging indefinitely.
+
+The server also sets ZMQ socket timeouts (`kernel_channel_timeout_s`, default 5s) on all
+kernel channels, so a stuck kernel won't block subsequent operations.
 
 ## Error Handling
 
