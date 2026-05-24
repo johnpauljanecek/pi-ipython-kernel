@@ -257,6 +257,7 @@ export default function (pi: ExtensionAPI) {
 				const kernelFile = expandUser("~/kernels/ipyforge-kernel.json");
 
 				// Spawn kernel
+				let spawnError: string | null = null;
 				const proc = execa(
 					"uv",
 					["tool", "run", "--from", "ipython", "python", "-m", "ipykernel", "-f", kernelFile],
@@ -266,11 +267,19 @@ export default function (pi: ExtensionAPI) {
 						stderr: { file: cfg.kernel_log_file },
 					},
 				);
+				proc.catch((err) => {
+					spawnError = err instanceof Error ? err.message : String(err);
+				});
 
 				const pid = proc.pid as number;
 
 				// Wait for kernel file to be created
 				await waitForKernelFile(kernelFile);
+
+				// Verify process is still alive (didn't crash on startup)
+				if (spawnError) {
+					throw `Kernel process exited during startup: ${spawnError}. Check ${cfg.kernel_log_file}`;
+				}
 
 				// Update config
 				const updatedCfg: Config = {
