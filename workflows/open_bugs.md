@@ -73,18 +73,18 @@ literally as a filename character.
 
 ---
 
-## BUG-05: `workflows/` gitignored but workflow files are tracked
+## ~~BUG-05: `workflows/` gitignored but workflow files are tracked~~ ✅ RESOLVED
 
 **Severity:** Low  
-**File:** `.gitignore`
+**File:** `.gitignore`  
+**Commit:** `4af7d47`
 
-`.gitignore` contains `workflows/` but `workflows/ipy-skill-implementation.md`
-and `workflows/2026-05-24-pi-package-migration.md` are both committed. They're
+`.gitignore` contains `workflows/` but workflow files are committed. They're
 in a "tracked but gitignored" state — changes to existing tracked files are
 seen by git, but new files won't be tracked. This is inconsistent.
 
-**Fix:** Either remove `workflows/` from `.gitignore` (if you want them
-versioned) or `git rm --cached` the tracked files to stop tracking them.
+**Resolution:** Removed `workflows/` from `.gitignore`. Workflow docs are
+intended to be versioned.
 
 ---
 
