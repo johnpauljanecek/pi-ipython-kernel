@@ -1,13 +1,20 @@
 {
   "name": "@johnjanecek/ipyforge-kernel",
   "version": "0.1.0",
-  "keywords": ["pi-package"],
+  "keywords": [
+    "pi-package"
+  ],
   "description": "Pi extension for controlling an IPython kernel via HTTP",
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
     "typebox": "*"
   },
   "pi": {
-    "extensions": ["./extensions"]
+    "extensions": [
+      "./extensions"
+    ]
+  },
+  "dependencies": {
+    "execa": "^9.6.1"
   }
 }
