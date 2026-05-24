@@ -70,7 +70,14 @@ function loadConfig(): Config {
 		return getDefaultConfig();
 	}
 	const raw = JSON.parse(readFileSync(cfgPath, "utf-8")) as Partial<Config>;
-	return getDefaultConfig(raw);
+	// Expand ~/ in user-provided path fields
+	const expanded: Partial<Config> = { ...raw };
+	for (const key of ["kernel_connection_file", "kernel_log_file", "server_log_file", "default_cwd"] as const) {
+		if (typeof expanded[key] === "string") {
+			expanded[key] = expandUser(expanded[key] as string);
+		}
+	}
+	return getDefaultConfig(expanded);
 }
 
 function getDefaultConfig(overrides: Partial<Config> = {}): Config {
