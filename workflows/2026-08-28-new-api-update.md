@@ -1,7 +1,7 @@
 # Workflow: Update Extension for Current pi Extension API
 
 **Date**: 2026-08-28
-**Status**: Pending
+**Status**: ✅ Done (Phase A + Phase B committed; see git log `dbeb441`, `e8d03e7`)
 **Depends on**: Review of `docs/extensions.md`, `docs/packages.md`, and installed type defs in
 `@earendil-works/pi-coding-agent` (dist/core/extensions/types.d.ts, pi-agent-core dist/types.d.ts)
 
@@ -694,21 +694,21 @@ pruned; reconnect to the live one after a pi restart; `kernel_stop` removes the 
 
 ## Acceptance Checklist
 
-- [ ] Zero `isError: true` returns in `extensions/index.ts`; all failures throw
-- [ ] No `session_shutdown` cleanup needed — no session-scoped resources (steps 2 + 17)
-- [ ] Esc aborts in-flight kernel calls via `signal`; fetch timeout tracks `timeout_s` + 15s (60s default), control calls 10s (step 3)
-- [ ] Concurrent tool calls don't double-start the bridge (step 4)
-- [ ] Shared-state kernel tools are `executionMode: "sequential"` (step 5)
-- [ ] `killStaleServer`/`lsof` removed entirely (steps 6 + 17)
-- [ ] Server timeout is an overall deadline, not per-message (if step 9 applied)
-- [ ] `kernel_stop` never signals a reused PID (graceful + liveness-verified, step 10)
-- [ ] State lives in the kernel registry `~/.ipy/kernels/<name>/meta.json` (steps 8 + 17)
-- [ ] `kernel_start` supports `python: "" | "project" | <spec> | <path>` via uv and an optional `name` (step 16)
-- [ ] Kernels are detached/persistent; bridge + kernel survive pi exit and terminal death (step 18)
-- [ ] Two concurrent pi sessions attach to the same kernel by name via its bridge (step 17)
-- [ ] `kernel_list` lists live kernels, reaps orphaned bridges, prunes dead entries (step 18)
-- [ ] `kernel_connect {name}` / `{path}` attach to registered or external kernels (on-demand bridge)
-- [ ] `kernel_start` name collision: attach if live, replace if dead (step 17)
-- [ ] Bridge self-provisions via `uv run --with …` (no `.venv` required, step 17)
-- [ ] `npx tsc --noEmit` clean; end-to-end flow passes; no leaked bridges/kernels
-- [ ] Header/README/skill tool counts consistent (9)
+- [x] Zero `isError: true` returns in `extensions/index.ts`; all failures throw
+- [x] No `session_shutdown` cleanup needed — no session-scoped resources (steps 2 + 17)
+- [x] Esc aborts in-flight kernel calls via `signal`; fetch timeout tracks `timeout_s` + 15s (60s default), control calls 10s (step 3)
+- [x] Concurrent tool calls don't double-start the bridge (step 4)
+- [x] Shared-state kernel tools are `executionMode: "sequential"` (step 5)
+- [x] `killStaleServer`/`lsof` removed entirely (steps 6 + 17)
+- [x] Server timeout is an overall deadline, not per-message (step 9)
+- [x] `kernel_stop` never signals a reused PID (graceful + liveness-verified, step 10)
+- [x] State lives in the kernel registry `~/.ipy/kernels/<name>/meta.json` (steps 8 + 17)
+- [x] `kernel_start` supports `python: "" | "project" | <spec> | <path>` via uv and an optional `name` (step 16)
+- [x] Kernels are detached/persistent; bridge + kernel survive pi exit and terminal death (step 18)
+- [x] Two concurrent pi sessions attach to the same kernel by name via its bridge (step 17)
+- [x] `kernel_list` lists live kernels, reaps orphaned bridges, prunes dead entries (step 18)
+- [x] `kernel_connect {name}` / `{path}` attach to registered or external kernels (on-demand bridge)
+- [x] `kernel_start` name collision: attach if live, replace if dead (step 17)
+- [x] Bridge self-provisions via `uv run --with …` (no `.venv` required, step 17)
+- [x] `npx tsc --noEmit` clean (against both local 0.75.5 and runtime 0.84.3 types); end-to-end smoke test passes; no leaked bridges/kernels
+- [x] Header/README/skill tool counts consistent (9)
