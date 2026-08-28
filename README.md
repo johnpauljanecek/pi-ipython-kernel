@@ -38,6 +38,7 @@ pi -e git:github.com/johnjanecek/ipyforge-kernel
 | `kernel_list` | List kernels in the registry (prunes dead entries) |
 | `kernel_stop` | Stop a kernel and its bridge |
 | `kernel_status` | Show the connected kernel + registry summary |
+| `kernel_console_cmd` | One-line command to attach a Jupyter console to a kernel |
 
 ## Quick Start
 

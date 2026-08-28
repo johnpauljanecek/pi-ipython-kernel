@@ -3,7 +3,7 @@
  *
  * Installed via: pi install /path/to/ipython_package
  *
- * Registers 9 custom tools that manage persistent, named IPython kernels. Each
+ * Registers 10 custom tools that manage persistent, named IPython kernels. Each
  * kernel owns a companion FastAPI bridge (one per kernel, never shared) that
  * wraps jupyter_client.BlockingKernelClient. Kernels and their bridges are
  * registered under ~/.ipy/kernels/<name>/ and outlive pi sessions; they are
@@ -19,6 +19,7 @@
  *   kernel_list         — list kernels in the registry (prunes dead entries)
  *   kernel_stop         — stop a kernel (and its bridge)
  *   kernel_status       — show the connected kernel + registry state
+ *   kernel_console_cmd  — one-line command to attach a Jupyter console
  */
 
 import { defineTool, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -930,6 +931,46 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	// -----------------------------------------------------------------------
+	// 10. kernel_console_cmd
+	// -----------------------------------------------------------------------
+	const kernelConsoleCmdTool = defineTool({
+		name: "kernel_console_cmd",
+		label: "Kernel Console Command",
+		description:
+			"Show the one-line command to attach a Jupyter console to a kernel (copy-paste ready), " +
+			"using the kernel's own Python environment. Use kernel_connect first, or pass a name.",
+		promptSnippet: "Show the jupyter console command for a kernel",
+		promptGuidelines: [
+			"Use kernel_console_cmd to get a copy-paste command that opens a Jupyter console attached to a running kernel.",
+		],
+		parameters: Type.Object({
+			name: Type.Optional(
+				Type.String({ description: "Registered kernel name (default: connected kernel)" }),
+			),
+		}),
+		async execute(_toolCallId, params, signal, _onUpdate, _ctx) {
+			try {
+				const name = params.name ?? requireConnectedName();
+				const meta = readMeta(name);
+				if (!meta) throw new Error(`Kernel '${name}' not found in registry.`);
+				const data = await kernelGet(name, "/kernel/python", { signal });
+				const executable = data.executable as string;
+				const jupyterBin = data.jupyter_bin as string | null;
+				const kernelFile = meta.kernel_file;
+				const cmd = jupyterBin
+					? `"${jupyterBin}" console --existing "${kernelFile}"`
+					: `"${executable}" -m jupyter console --existing "${kernelFile}"`;
+				return {
+					content: [{ type: "text", text: cmd }],
+					details: { command: cmd, kernel: name, executable, jupyter_bin: jupyterBin, kernel_file: kernelFile },
+				};
+			} catch (err) {
+				throw new Error(`❌ ${errMsg(err)}`);
+			}
+		},
+	});
+
 	pi.registerTool(kernelStartTool);
 	pi.registerTool(kernelConnectTool);
 	pi.registerTool(kernelRunPythonTool);
@@ -939,4 +980,5 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool(kernelListTool);
 	pi.registerTool(kernelStopTool);
 	pi.registerTool(kernelStatusTool);
+	pi.registerTool(kernelConsoleCmdTool);
 }

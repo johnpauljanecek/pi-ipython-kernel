@@ -21,6 +21,7 @@ import os
 import signal
 import socket
 import subprocess
+import sys
 import threading
 import time
 import urllib.error
@@ -205,6 +206,18 @@ def test_get_output_cache(session):
     status, data = http("POST", url(session, "/kernel/get-output"), {"start": 0, "limit": 200}, TOKEN)
     assert status == 200
     assert "cache-me" in data["output"]
+
+
+def test_kernel_python_returns_kernel_env(session):
+    # /kernel/python must report the KERNEL's interpreter (queried via the
+    # kernel), not the bridge's env.
+    status, data = http("GET", url(session, "/kernel/python"), token=TOKEN)
+    assert status == 200
+    assert data["executable"] and Path(data["executable"]).is_file()
+    assert data["executable"] != sys.executable  # kernel env ≠ pytest/bridge env
+    # endpoint is token-protected like the rest
+    status_noauth, _ = http("GET", url(session, "/kernel/python"))
+    assert status_noauth == 401
 
 
 def test_no_socket_leak_under_sustained_use(session):

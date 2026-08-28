@@ -234,6 +234,49 @@ def _shutdown_blocking() -> None:
     _connected = True
 
 
+def _get_kernel_python_blocking() -> dict[str, Any]:
+    """Return the kernel's own sys.executable (the bridge env may differ)."""
+    global client, _connected
+    if client is None:
+        raise RuntimeError("Bridge has no kernel client")
+    with _shell_lock:
+        msg_id = client.execute(
+            "import sys; print(sys.executable)",
+            silent=False,
+            store_history=False,
+            allow_stdin=False,
+        )
+        out: list[str] = []
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Timed out determining kernel python")
+            try:
+                msg = client.get_iopub_msg(timeout=min(remaining, 1.0))
+            except queue.Empty:
+                continue
+            if msg.get("parent_header", {}).get("msg_id") != msg_id:
+                continue
+            mt = msg.get("msg_type")
+            content = msg.get("content", {}) or {}
+            if mt == "stream":
+                out.append(content.get("text", ""))
+            elif mt == "error":
+                raise RuntimeError("\n".join(content.get("traceback", []) or []) or "error")
+            elif mt == "status" and content.get("execution_state") == "idle":
+                break
+        text = "".join(out).strip()
+        if not text:
+            raise RuntimeError("Could not determine kernel python executable")
+        executable = text.splitlines()[-1]
+        jupyter_bin = str(Path(executable).parent / "jupyter")
+        return {
+            "executable": executable,
+            "jupyter_bin": jupyter_bin if Path(jupyter_bin).exists() else None,
+        }
+
+
 # ---------------------------------------------------------------------------
 # Request models
 # ---------------------------------------------------------------------------
@@ -288,6 +331,14 @@ def kernel_status():
         "connection_file": kernel_file,
         "port": bridge_port,
     }
+
+
+@kernel_router.get("/kernel/python")
+async def kernel_python():
+    try:
+        return await asyncio.to_thread(_get_kernel_python_blocking)
+    except Exception as e:
+        raise HTTPException(502, detail=str(e))
 
 
 @kernel_router.post("/kernel/run-code")

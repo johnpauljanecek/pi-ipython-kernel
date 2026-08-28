@@ -20,6 +20,7 @@ Pi skill for controlling IPython kernels. Each kernel is a **persistent named re
 | `kernel_list` | List all kernels in the registry; prunes dead entries. |
 | `kernel_stop` | Stop a kernel (and its bridge) by name/path, or the connected one. |
 | `kernel_status` | Show the connected kernel + registry summary. |
+| `kernel_console_cmd` | One-line command to attach a Jupyter console (uses the kernel's own env). |
 
 ## Lifecycle
 
@@ -109,6 +110,14 @@ kernel_status
 kernel_stop                 # stops the connected kernel
 kernel_stop { "name": "data" }
 ```
+
+### Attach a Jupyter console
+
+```
+kernel_console_cmd
+```
+
+Returns a single copy-paste line (e.g. `"/path/to/kernel-env/bin/jupyter" console --existing "/Users/.../.ipy/kernels/<name>/kernel.json"`) that opens a Jupyter console attached to the running kernel, using the kernel's own Python environment.
 
 ## Registry
 
