@@ -231,6 +231,31 @@ async function kernelIsAlive(meta: KernelMeta): Promise<boolean> {
 	return nowStart === meta.started_at;
 }
 
+async function stopBridge(meta: KernelMeta): Promise<void> {
+	// Graceful: /shutdown makes the actual python bridge os._exit(0). This is
+	// the reliable path because `meta.bridge_pid` is the `uv run` wrapper, which
+	// spawns the python bridge as a child — killing the wrapper alone would
+	// orphan the bridge. Always try /shutdown first.
+	if (await bridgeHealthy(meta.bridge_port)) {
+		try {
+			const headers: Record<string, string> = {};
+			if (meta.auth_token) headers["X-IPY-TOKEN"] = meta.auth_token;
+			await fetch(`http://127.0.0.1:${meta.bridge_port}/shutdown`, {
+				method: "POST",
+				headers,
+				signal: AbortSignal.timeout(CONTROL_TIMEOUT_MS),
+			});
+			await sleep(400); // let os._exit fire
+		} catch {
+			/* bridge may already be gone */
+		}
+	}
+	// Fallback: hard-kill the uv wrapper (best effort)
+	if (meta.bridge_pid && pidAlive(meta.bridge_pid)) {
+		try { process.kill(meta.bridge_pid, "SIGKILL"); } catch { /* gone */ }
+	}
+}
+
 function findFreePort(): Promise<number> {
 	return new Promise((res, rej) => {
 		const srv = createServer();
@@ -950,9 +975,7 @@ export default function (pi: ExtensionAPI) {
 					if (params.kill_external && meta.kernel_pid && pidAlive(meta.kernel_pid)) {
 						try { process.kill(meta.kernel_pid, "SIGKILL"); } catch { /* gone */ }
 					}
-					if (meta.bridge_pid && pidAlive(meta.bridge_pid)) {
-						try { process.kill(meta.bridge_pid, "SIGKILL"); } catch { /* gone */ }
-					}
+					await stopBridge(meta);
 					deleteKernelDir(name);
 					if (connectedName === name) connectedName = null;
 					return {
@@ -971,15 +994,8 @@ export default function (pi: ExtensionAPI) {
 					// bridge unreachable — fall through to process kill
 				}
 
-				// Stop the bridge (best-effort /shutdown, then hard kill)
-				try {
-					await kernelPost(name, "/shutdown", {}, { signal });
-				} catch {
-					/* bridge may already be gone */
-				}
-				if (meta.bridge_pid && pidAlive(meta.bridge_pid)) {
-					try { process.kill(meta.bridge_pid, "SIGKILL"); } catch { /* gone */ }
-				}
+				// Stop the bridge (graceful /shutdown first, then hard kill)
+				await stopBridge(meta);
 
 				// Kill the kernel only if still alive and identity-verified
 				if (await kernelIsAlive(meta)) {
