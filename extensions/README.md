@@ -1,8 +1,9 @@
 # ipyforge-kernel — Pi Extension
 
-This extension registers 8 custom tools that communicate with the
-[ipyforge-kernel-server](../server/), a FastAPI server wrapping
-`jupyter_client.BlockingKernelClient`.
+This extension registers 9 custom tools that manage persistent, named IPython
+kernels. Each kernel owns a companion FastAPI bridge (one per kernel, never
+shared) wrapping `jupyter_client.BlockingKernelClient`, registered under
+`~/.ipy/kernels/<name>/`.
 
 ## Installation
 
@@ -22,21 +23,24 @@ pi install npm:@johnjanecek/ipyforge-kernel
 
 | Tool | Description |
 |------|-------------|
-| `kernel_start` | Start a new IPython kernel |
-| `kernel_connect` | Connect to a kernel via kernel.json or cfg.json |
+| `kernel_start` | Start a new named IPython kernel (persistent) |
+| `kernel_connect` | Attach to a kernel by name, or an external kernel by path |
 | `kernel_run_python` | Execute Python code, return captured output |
 | `kernel_eval_expr` | Evaluate a Python expression |
 | `kernel_interrupt` | Interrupt a stuck kernel |
 | `kernel_get_output` | Retrieve cached output slices |
-| `kernel_stop` | Stop a Pi-created kernel |
-| `kernel_status` | Show server and kernel connection state |
+| `kernel_list` | List kernels in the registry (prunes dead entries) |
+| `kernel_stop` | Stop a kernel and its bridge |
+| `kernel_status` | Show the connected kernel + registry summary |
 
-## Prerequisites
+## Lifecycle
 
-The server is started internally on first tool call. No manual server startup
-is needed. Monitor logs with:
+Kernels are persistent named resources (see `../README.md`). They survive pi
+sessions and are stopped only by `kernel_stop`, a crash, or a reboot. No manual
+server startup is needed — each kernel's bridge starts on demand and is stopped
+with the kernel. Monitor logs with:
 
 ```bash
-tail -f ~/.ipy/kernel.log
-tail -f ~/.ipy/server.log
+tail -f ~/.ipy/kernels/<name>/kernel.log
+tail -f ~/.ipy/kernels/<name>/bridge.log
 ```

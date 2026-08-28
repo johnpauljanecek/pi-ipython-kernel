@@ -1,12 +1,9 @@
 {
-  "port": 9123,
-  "kernel_connection_file": "~/kernels/ipyforge-kernel.json",
+  "python": "",
+  "default_cwd": "~/",
   "max_output_chars": 20000,
   "default_timeout_s": 60,
   "kernel_channel_timeout_s": 5,
-  "default_cwd": "~/",
-  "kernel_auto_created": false,
-  "kernel_pid": null,
-  "kernel_log_file": "~/.ipy/kernel.log",
-  "server_log_file": "~/.ipy/server.log"
+  "default_connect": "",
+  "auth_token": ""
 }

@@ -3,35 +3,47 @@
  *
  * Installed via: pi install /path/to/ipython_package
  *
- * Registers 8 custom tools that communicate with a local FastAPI server
- * (ipyforge-kernel-server) wrapping jupyter_client.BlockingKernelClient.
- *
- * Server is started internally on first tool call.
- * Tools use execa to spawn kernel and server processes.
+ * Registers 9 custom tools that manage persistent, named IPython kernels. Each
+ * kernel owns a companion FastAPI bridge (one per kernel, never shared) that
+ * wraps jupyter_client.BlockingKernelClient. Kernels and their bridges are
+ * registered under ~/.ipy/kernels/<name>/ and outlive pi sessions; they are
+ * stopped explicitly via kernel_stop (or reaped by kernel_list when dead).
  *
  * Tools:
- *   kernel_start        — start a new IPython kernel
- *   kernel_connect      — connect to a kernel via its kernel.json file
- *   kernel_run_python   — execute Python code in the kernel
+ *   kernel_start        — start a new named IPython kernel (persistent)
+ *   kernel_connect      — attach to a kernel by name, or an external kernel.json
+ *   kernel_run_python   — execute Python code in the connected kernel
  *   kernel_eval_expr    — evaluate a Python expression
  *   kernel_interrupt    — interrupt the running kernel
  *   kernel_get_output   — retrieve cached output from the last run
- *   kernel_stop         — stop a Pi-created kernel
- *   kernel_status       — show connection and server state
+ *   kernel_list         — list kernels in the registry (prunes dead entries)
+ *   kernel_stop         — stop a kernel (and its bridge)
+ *   kernel_status       — show the connected kernel + registry state
  */
 
 import { defineTool, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { execa } from "execa";
-import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync } from "fs";
-import { resolve } from "path";
+import {
+	readFileSync,
+	writeFileSync,
+	existsSync,
+	mkdirSync,
+	renameSync,
+	rmSync,
+	readdirSync,
+} from "fs";
+import { resolve, join, basename } from "path";
 import { homedir } from "os";
+import { createServer } from "net";
+import { randomBytes } from "crypto";
 
-const SERVER = "http://127.0.0.1:9123";
 const CONFIG_FILENAME = "cfg.json";
 const CONTROL_TIMEOUT_MS = 10_000;
 const TIMEOUT_MARGIN_S = 15;
-const SERVER_START_TIMEOUT_MS = 15_000;
+const KERNELS_DIR = join(homedir(), ".ipy", "kernels");
+const BRIDGE_START_TIMEOUT_MS = 30_000;
+const KERNEL_FILE_TIMEOUT_MS = 30_000;
 
 // ---------------------------------------------------------------------------
 // Utilities
@@ -48,20 +60,26 @@ function errMsg(err: unknown): string {
 	return err instanceof Error ? err.message : String(err);
 }
 
+function sleep(ms: number): Promise<void> {
+	return new Promise<void>((r) => setTimeout(r, ms));
+}
+
+function slugify(s: string): string {
+	return s.replace(/[^\w.-]+/g, "-").replace(/^-+|-+$/g, "") || "kernel";
+}
+
 // ---------------------------------------------------------------------------
-// Config
+// Config (user preferences only — runtime state lives in the kernel registry)
 // ---------------------------------------------------------------------------
 
 interface Config {
-	port: number;
-	kernel_connection_file: string;
+	python: string;
+	default_cwd: string;
 	max_output_chars: number;
 	default_timeout_s: number;
-	default_cwd: string;
-	kernel_auto_created: boolean;
-	kernel_pid: number | null;
-	kernel_log_file: string;
-	server_log_file: string;
+	kernel_channel_timeout_s: number;
+	default_connect: string;
+	auth_token: string;
 }
 
 function getExtensionDir(): string {
@@ -75,44 +93,127 @@ function loadConfig(): Config {
 		return getDefaultConfig();
 	}
 	const raw = JSON.parse(readFileSync(cfgPath, "utf-8")) as Partial<Config>;
-	// Expand ~/ in user-provided path fields
 	const expanded: Partial<Config> = { ...raw };
-	for (const key of ["kernel_connection_file", "kernel_log_file", "server_log_file", "default_cwd"] as const) {
-		if (typeof expanded[key] === "string") {
-			expanded[key] = expandUser(expanded[key] as string);
-		}
+	if (typeof expanded.default_cwd === "string") {
+		expanded.default_cwd = expandUser(expanded.default_cwd);
+	}
+	if (typeof expanded.default_connect === "string" && expanded.default_connect.startsWith("~/")) {
+		expanded.default_connect = expandUser(expanded.default_connect);
 	}
 	return getDefaultConfig(expanded);
 }
 
 function getDefaultConfig(overrides: Partial<Config> = {}): Config {
 	return {
-		port: 9123,
-		kernel_connection_file: "",
+		python: "",
+		default_cwd: homedir(),
 		max_output_chars: 20000,
 		default_timeout_s: 60,
-		default_cwd: homedir(),
-		kernel_auto_created: false,
-		kernel_pid: null,
-		kernel_log_file: `${homedir()}/.ipy/kernel.log`,
-		server_log_file: `${homedir()}/.ipy/server.log`,
+		kernel_channel_timeout_s: 5,
+		default_connect: "",
+		auth_token: "",
 		...overrides,
 	};
 }
 
-function saveConfig(cfg: Config): void {
-	const cfgPath = resolve(getExtensionDir(), CONFIG_FILENAME);
-	writeFileSync(cfgPath, JSON.stringify(cfg, null, 2), "utf-8");
+// ---------------------------------------------------------------------------
+// Kernel registry (~/.ipy/kernels/<name>/)
+// ---------------------------------------------------------------------------
+
+interface KernelMeta {
+	name: string;
+	kernel_pid: number;
+	bridge_pid: number | null;
+	bridge_port: number;
+	kernel_file: string;
+	python: string;
+	cwd: string;
+	started_at: string;
+	started_by: string;
+	external: boolean;
+	auth_token: string;
+}
+
+function kernelDir(name: string): string {
+	return join(KERNELS_DIR, name);
+}
+
+function metaPath(name: string): string {
+	return join(kernelDir(name), "meta.json");
+}
+
+function readMeta(name: string): KernelMeta | null {
+	try {
+		return JSON.parse(readFileSync(metaPath(name), "utf-8")) as KernelMeta;
+	} catch {
+		return null;
+	}
+}
+
+function writeMeta(name: string, meta: KernelMeta): void {
+	const dir = kernelDir(name);
+	if (!existsSync(dir)) {
+		mkdirSync(dir, { recursive: true });
+	}
+	const finalPath = metaPath(name);
+	const tmpPath = `${finalPath}.tmp`;
+	writeFileSync(tmpPath, JSON.stringify(meta, null, 2), "utf-8");
+	renameSync(tmpPath, finalPath);
+}
+
+function deleteKernelDir(name: string): void {
+	try {
+		rmSync(kernelDir(name), { recursive: true, force: true });
+	} catch {
+		/* already gone */
+	}
+}
+
+function listKernelNames(): string[] {
+	try {
+		if (!existsSync(KERNELS_DIR)) return [];
+		return readdirSync(KERNELS_DIR, { withFileTypes: true })
+			.filter((d) => d.isDirectory())
+			.map((d) => d.name);
+	} catch {
+		return [];
+	}
+}
+
+function findKernelByFile(file: string): string | null {
+	const target = resolve(file);
+	for (const name of listKernelNames()) {
+		const meta = readMeta(name);
+		if (meta && resolve(meta.kernel_file) === target) return name;
+	}
+	return null;
+}
+
+async function waitForKernelFile(path: string, timeoutMs = KERNEL_FILE_TIMEOUT_MS): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		if (existsSync(path)) return;
+		await sleep(200);
+	}
+	throw new Error(`Kernel connection file not created within ${timeoutMs}ms`);
 }
 
 // ---------------------------------------------------------------------------
-// Server helpers
+// Process helpers
 // ---------------------------------------------------------------------------
 
-let serverStarted = false;
-let serverProcess: ReturnType<typeof execa> | null = null;
-let kernelProcess: ReturnType<typeof execa> | null = null;
-let kernelStartedAt: string | null = null;
+let connectedName: string | null = null;
+const bridgeStartPromises = new Map<string, Promise<number>>();
+
+function pidAlive(pid: number): boolean {
+	if (!pid || pid <= 0) return false;
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch {
+		return false;
+	}
+}
 
 async function procStartTime(pid: number): Promise<string | null> {
 	try {
@@ -123,88 +224,130 @@ async function procStartTime(pid: number): Promise<string | null> {
 	}
 }
 
-async function killStaleServer(port: number): Promise<void> {
-	// Kill the tracked process if we have one
-	if (serverProcess) {
-		try { serverProcess.kill(); } catch { /* already dead */ }
-		serverProcess = null;
-	}
-	// Kill any process already listening on the server port
+async function kernelIsAlive(meta: KernelMeta): Promise<boolean> {
+	if (!pidAlive(meta.kernel_pid)) return false;
+	if (!meta.started_at) return true;
+	const nowStart = await procStartTime(meta.kernel_pid);
+	return nowStart === meta.started_at;
+}
+
+function findFreePort(): Promise<number> {
+	return new Promise((res, rej) => {
+		const srv = createServer();
+		srv.unref();
+		srv.on("error", rej);
+		srv.listen(0, "127.0.0.1", () => {
+			const address = srv.address();
+			const port = typeof address === "object" && address ? address.port : 0;
+			srv.close(() => res(port));
+		});
+	});
+}
+
+async function bridgeHealthy(port: number): Promise<boolean> {
 	try {
-		const { stdout } = await execa("lsof", ["-ti", `:${port}`], { reject: false });
-		const pids = stdout.trim();
-		if (pids) {
-			for (const pid of pids.split("\n")) {
-				try { process.kill(Number(pid)); } catch { /* already dead */ }
-			}
-			// Brief wait for the port to free up
-			await new Promise<void>((r) => setTimeout(r, 500));
-		}
-	} catch { /* lsof not available or no match */ }
+		await fetch(`http://127.0.0.1:${port}/health`, { signal: AbortSignal.timeout(2000) });
+		return true;
+	} catch {
+		return false;
+	}
 }
 
-async function ensureServerRunning(): Promise<void> {
-	if (serverStarted) {
-		// Verify it's still reachable — if not, reset and restart
-		try {
-			await fetch(`${SERVER}/health`, { signal: AbortSignal.timeout(2000) });
-			return;
-		} catch {
-			serverStarted = false;
-		}
-	}
-
-	const cfg = loadConfig();
-
-	// Kill any stale server (from previous session or tracked process)
-	await killStaleServer(cfg.port);
-
-	// Ensure log directory exists
-	const logDir = resolve(cfg.server_log_file, "..");
-	if (!existsSync(logDir)) {
-		mkdirSync(logDir, { recursive: true });
-	}
-
-	// Start server and track the process
-	serverProcess = execa("uv", ["run", "python", "server/main.py"], {
-		cwd: getExtensionDir(),
-		stdout: { file: cfg.server_log_file },
-		stderr: { file: cfg.server_log_file },
-	});
-	serverProcess.catch(() => {
-		serverStarted = false;
-		serverProcess = null;
-	});
-
-	// Poll health endpoint until ready or timeout
-	const deadline = Date.now() + SERVER_START_TIMEOUT_MS;
-	while (Date.now() < deadline) {
-		try {
-			await fetch(`${SERVER}/health`, { signal: AbortSignal.timeout(1000) });
-			serverStarted = true;
-			return;
-		} catch {
-			await new Promise<void>((r) => setTimeout(r, 300));
-		}
-	}
-	throw new Error(`Server failed to start within ${SERVER_START_TIMEOUT_MS}ms. Check ${cfg.server_log_file}`);
-}
-
-// ---------------------------------------------------------------------------
-// Kernel helpers
-// ---------------------------------------------------------------------------
-
-async function waitForKernelFile(path: string, timeoutMs = 5000): Promise<void> {
+async function waitForHealth(port: number, timeoutMs: number): Promise<void> {
 	const deadline = Date.now() + timeoutMs;
 	while (Date.now() < deadline) {
-		if (existsSync(path)) return;
-		await new Promise<void>((r) => setTimeout(r, 200));
+		if (await bridgeHealthy(port)) return;
+		await sleep(300);
 	}
-	throw new Error(`Kernel connection file not created within ${timeoutMs}ms`);
+	throw new Error(`Bridge failed to become healthy on port ${port} within ${timeoutMs}ms`);
 }
 
 // ---------------------------------------------------------------------------
-// Server communication
+// Spawn helpers (detached, file-logged)
+// ---------------------------------------------------------------------------
+
+function buildKernelCommand(python: string, kernelFile: string): string[] {
+	if (!python) {
+		return ["tool", "run", "--from", "ipython", "--with", "ipykernel", "python", "-m", "ipykernel", "-f", kernelFile];
+	}
+	if (python === "project") {
+		return ["run", "--with", "ipykernel", "python", "-m", "ipykernel", "-f", kernelFile];
+	}
+	// Version spec (e.g. "3.11") or absolute interpreter/venv path
+	return ["run", "--isolated", "--python", python, "--with", "ipykernel", "python", "-m", "ipykernel", "-f", kernelFile];
+}
+
+function spawnKernel(kernelFile: string, python: string, cwd: string, logFile: string): ReturnType<typeof execa> {
+	const proc = execa("uv", buildKernelCommand(python, kernelFile), {
+		cwd,
+		detached: true,
+		stdout: { file: logFile },
+		stderr: { file: logFile },
+	});
+	proc.catch(() => {
+		/* process exit tracked separately; errors surface via kernel.json / log */
+	});
+	return proc;
+}
+
+function spawnBridge(name: string, kernelFile: string, port: number, token: string): ReturnType<typeof execa> {
+	const args = [
+		"run",
+		"--with", "fastapi",
+		"--with", "uvicorn",
+		"--with", "jupyter_client",
+		"--with", "pyzmq",
+		"--with", "pydantic",
+		"python", "server/main.py",
+		"--kernel-file", kernelFile,
+		"--port", String(port),
+		"--token", token,
+	];
+	const logFile = join(kernelDir(name), "bridge.log");
+	const proc = execa("uv", args, {
+		cwd: getExtensionDir(),
+		detached: true,
+		stdout: { file: logFile },
+		stderr: { file: logFile },
+	});
+	proc.catch(() => {
+		/* bridge exit tracked via health checks */
+	});
+	return proc;
+}
+
+// ---------------------------------------------------------------------------
+// Bridge management
+// ---------------------------------------------------------------------------
+
+async function ensureBridgeRunning(name: string): Promise<number> {
+	const meta = readMeta(name);
+	if (meta && (await bridgeHealthy(meta.bridge_port))) return meta.bridge_port;
+
+	const pending = bridgeStartPromises.get(name);
+	if (pending) return pending;
+
+	const p = (async () => {
+		const m = readMeta(name);
+		if (!m) throw new Error(`Kernel '${name}' not found in registry.`);
+		const port = await findFreePort();
+		const proc = spawnBridge(name, m.kernel_file, port, m.auth_token);
+		await waitForHealth(port, BRIDGE_START_TIMEOUT_MS);
+		const updated = readMeta(name);
+		if (updated) {
+			updated.bridge_port = port;
+			updated.bridge_pid = proc.pid ?? null;
+			writeMeta(name, updated);
+		}
+		return port;
+	})().finally(() => bridgeStartPromises.delete(name));
+
+	bridgeStartPromises.set(name, p);
+	return p;
+}
+
+// ---------------------------------------------------------------------------
+// HTTP helpers (per-kernel bridge, auth token, signal-aware)
 // ---------------------------------------------------------------------------
 
 interface HttpOpts {
@@ -217,53 +360,70 @@ function httpSignal(timeoutS: number | undefined, signal?: AbortSignal): AbortSi
 	return signal ? AbortSignal.any([signal, AbortSignal.timeout(ms)]) : AbortSignal.timeout(ms);
 }
 
-async function serverPost(endpoint: string, body: Record<string, unknown> = {}, opts: HttpOpts = {}): Promise<Record<string, unknown>> {
-	await ensureServerRunning();
+async function kernelPost(
+	name: string,
+	endpoint: string,
+	body: Record<string, unknown> = {},
+	opts: HttpOpts = {},
+): Promise<Record<string, unknown>> {
+	const meta = readMeta(name);
+	const port = await ensureBridgeRunning(name);
+	const headers: Record<string, string> = { "Content-Type": "application/json" };
+	if (meta?.auth_token) headers["X-IPY-TOKEN"] = meta.auth_token;
 
-	const url = `${SERVER}${endpoint}`;
 	let res: Response;
-
 	try {
-		res = await fetch(url, {
+		res = await fetch(`http://127.0.0.1:${port}${endpoint}`, {
 			method: "POST",
-			headers: { "Content-Type": "application/json" },
+			headers,
 			body: JSON.stringify(body),
 			signal: httpSignal(opts.timeoutS, opts.signal),
 		});
 	} catch (err) {
-		throw new Error(`Cannot reach kernel server at ${SERVER}.\n${errMsg(err)}`);
+		throw new Error(`Cannot reach kernel bridge for '${name}'.\n${errMsg(err)}`);
 	}
 
 	const data = (await res.json()) as Record<string, unknown>;
-
 	if (!res.ok) {
 		const detail = typeof data.detail === "string" ? data.detail : `HTTP ${res.status}`;
 		throw new Error(`Server error: ${detail}`);
 	}
-
 	return data;
 }
 
-async function serverGet(endpoint: string, opts: HttpOpts = {}): Promise<Record<string, unknown>> {
-	await ensureServerRunning();
+async function kernelGet(
+	name: string,
+	endpoint: string,
+	opts: HttpOpts = {},
+): Promise<Record<string, unknown>> {
+	const meta = readMeta(name);
+	const port = await ensureBridgeRunning(name);
+	const headers: Record<string, string> = {};
+	if (meta?.auth_token) headers["X-IPY-TOKEN"] = meta.auth_token;
 
-	const url = `${SERVER}${endpoint}`;
 	let res: Response;
-
 	try {
-		res = await fetch(url, { signal: httpSignal(opts.timeoutS, opts.signal) });
+		res = await fetch(`http://127.0.0.1:${port}${endpoint}`, {
+			headers,
+			signal: httpSignal(opts.timeoutS, opts.signal),
+		});
 	} catch (err) {
-		throw new Error(`Cannot reach kernel server at ${SERVER}.\n${errMsg(err)}`);
+		throw new Error(`Cannot reach kernel bridge for '${name}'.\n${errMsg(err)}`);
 	}
 
 	const data = (await res.json()) as Record<string, unknown>;
-
 	if (!res.ok) {
 		const detail = typeof data.detail === "string" ? data.detail : `HTTP ${res.status}`;
 		throw new Error(`Server error: ${detail}`);
 	}
-
 	return data;
+}
+
+function requireConnectedName(): string {
+	if (!connectedName || !readMeta(connectedName)) {
+		throw new Error("No kernel connected. Use kernel_start or kernel_connect first.");
+	}
+	return connectedName;
 }
 
 // ---------------------------------------------------------------------------
@@ -278,92 +438,99 @@ export default function (pi: ExtensionAPI) {
 		name: "kernel_start",
 		label: "Kernel Start",
 		description:
-			"Start a new IPython kernel. " +
-			"Logs are written to the kernel_log_file in cfg.json. " +
-			"User can monitor logs with: tail -f ~/.ipy/kernel.log",
+			"Start a new named IPython kernel (persistent — survives pi exit; stop it with kernel_stop). " +
+			"Optionally pick the Python interpreter via `python` ('' = default uv ipython tool, 'project' = project env, or a version spec / interpreter path). " +
+			"List kernels with kernel_list.",
 		promptSnippet: "Start a new IPython kernel",
 		promptGuidelines: [
 			"Use kernel_start to create a new IPython kernel if one is not already running.",
-			"Monitor kernel output with: tail -f ~/.ipy/kernel.log",
+			"Kernels are persistent — stop them with kernel_stop when no longer needed.",
 		],
 		parameters: Type.Object({
+			name: Type.Optional(
+				Type.String({ description: "Kernel name (default: auto-generated kernel-<timestamp>)" }),
+			),
+			python: Type.Optional(
+				Type.String({ description: "Python env: '' (default), 'project', a version spec (e.g. '3.11'), or an interpreter/venv path" }),
+			),
 			cwd: Type.Optional(
-				Type.String({ description: "Working directory for kernel (default: from cfg.json)" }),
+				Type.String({ description: "Working directory for kernel (default: cfg.json default_cwd)" }),
 			),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
 			try {
 				const cfg = loadConfig();
-				const workingDir = params.cwd ?? cfg.default_cwd;
+				const name = params.name ?? `kernel-${Date.now()}`;
+				if (!/^[\w.-]+$/.test(name)) {
+					throw new Error(`Invalid kernel name '${name}' — use letters, digits, '_', '-', or '.'`);
+				}
+				const workingDir = expandUser(params.cwd ?? cfg.default_cwd);
+				const python = params.python ?? cfg.python;
 
-				// Ensure kernels directory exists
-				const kernelsDir = expandUser("~/kernels");
-				if (!existsSync(kernelsDir)) {
-					mkdirSync(kernelsDir, { recursive: true });
+				// Name collision (decision 5): attach if live, replace if dead.
+				const existing = readMeta(name);
+				if (existing) {
+					if (await kernelIsAlive(existing)) {
+						connectedName = name;
+						return {
+							content: [
+								{ type: "text", text: `ℹ️ Kernel '${name}' is already running (PID ${existing.kernel_pid}). Attached to it.` },
+							],
+							details: { name, kernel_pid: existing.kernel_pid },
+						};
+					}
+					deleteKernelDir(name);
 				}
 
-				// Ensure log directory exists
-				const logDir = resolve(cfg.kernel_log_file, "..");
-				if (!existsSync(logDir)) {
-					mkdirSync(logDir, { recursive: true });
-				}
+				const dir = kernelDir(name);
+				mkdirSync(dir, { recursive: true });
+				const kernelFile = join(dir, "kernel.json");
+				const kernelLog = join(dir, "kernel.log");
 
-				// Kernel connection file path
-				const kernelFile = expandUser("~/kernels/ipyforge-kernel.json");
-
-				// Kill any previously tracked kernel process
-				if (kernelProcess) {
-					try { kernelProcess.kill(); } catch { /* already dead */ }
-					kernelProcess = null;
-				}
-
-				// Spawn kernel and track the process
+				// Spawn kernel (detached, file-logged)
 				let spawnError: string | null = null;
-				kernelProcess = execa(
-					"uv",
-					["tool", "run", "--from", "ipython", "python", "-m", "ipykernel", "-f", kernelFile],
-					{
-						cwd: workingDir,
-						stdout: { file: cfg.kernel_log_file },
-						stderr: { file: cfg.kernel_log_file },
-					},
-				);
-				kernelProcess.catch((err) => {
-					spawnError = err instanceof Error ? err.message : String(err);
+				const kernelProc = spawnKernel(kernelFile, python, workingDir, kernelLog);
+				kernelProc.catch((err) => {
+					spawnError = errMsg(err);
+				});
+				const pid = kernelProc.pid as number;
+				const startedAt = (await procStartTime(pid)) ?? "";
+
+				// Wait for the connection file, then confirm the process didn't die
+				await waitForKernelFile(kernelFile, KERNEL_FILE_TIMEOUT_MS);
+				if (spawnError) {
+					throw new Error(`Kernel process exited during startup: ${spawnError}. Check ${kernelLog}`);
+				}
+
+				// Spawn the kernel's companion bridge on a fresh free port
+				const authToken = cfg.auth_token || randomBytes(16).toString("hex");
+				const port = await findFreePort();
+				const bridgeProc = spawnBridge(name, kernelFile, port, authToken);
+				await waitForHealth(port, BRIDGE_START_TIMEOUT_MS);
+
+				writeMeta(name, {
+					name,
+					kernel_pid: pid,
+					bridge_pid: bridgeProc.pid ?? null,
+					bridge_port: port,
+					kernel_file: kernelFile,
+					python,
+					cwd: workingDir,
+					started_at: startedAt,
+					started_by: process.env.PI_SESSION_ID ?? "unknown",
+					external: false,
+					auth_token: authToken,
 				});
 
-				const pid = kernelProcess.pid as number;
-
-				// Capture the process start time so kernel_stop can later verify
-				// identity before signaling (never signal a recycled PID).
-				kernelStartedAt = await procStartTime(pid);
-
-				// Wait for kernel file to be created
-				await waitForKernelFile(kernelFile);
-
-				// Verify process is still alive (didn't crash on startup)
-				if (spawnError) {
-					kernelProcess = null;
-					throw `Kernel process exited during startup: ${spawnError}. Check ${cfg.kernel_log_file}`;
-				}
-
-				// Update config
-				const updatedCfg: Config = {
-					...cfg,
-					kernel_connection_file: kernelFile,
-					kernel_auto_created: true,
-					kernel_pid: pid,
-				};
-				saveConfig(updatedCfg);
-
+				connectedName = name;
 				return {
 					content: [
 						{
 							type: "text",
-							text: `✅ Kernel started with PID ${pid}\nConnection file: ${kernelFile}\nLogs: ${cfg.kernel_log_file}\n\nMonitor output with: tail -f ${cfg.kernel_log_file}`,
+							text: `✅ Kernel '${name}' started (PID ${pid})\nPython: ${python || "default"}\nCwd: ${workingDir}\nBridge port: ${port}\n\nMonitor: tail -f ${kernelLog}`,
 						},
 					],
-					details: { pid, kernel_file: kernelFile },
+					details: { name, pid, bridge_port: port, kernel_file: kernelFile },
 				};
 			} catch (err) {
 				throw new Error(`❌ ${errMsg(err)}`);
@@ -378,45 +545,110 @@ export default function (pi: ExtensionAPI) {
 		name: "kernel_connect",
 		label: "Kernel Connect",
 		description:
-			"Connect to an existing IPython kernel via its connection file (kernel.json). " +
-			"If path is omitted, uses kernel_connection_file from cfg.json. " +
-			"Use this before running code or evaluating expressions.",
+			"Attach to a kernel by registry name, or connect to an external kernel via its kernel.json path (spawns an on-demand bridge). " +
+			"With neither, uses cfg.json default_connect. Use this before running code.",
 		promptSnippet: "Connect to an IPython kernel",
 		promptGuidelines: [
-			"Use kernel_connect first to establish a connection to a running IPython kernel before using kernel_run_python or kernel_eval_expr.",
+			"Use kernel_connect to attach to a named kernel, or to bring an external kernel.json under bridge management.",
 		],
 		parameters: Type.Object({
-			path: Type.Optional(
-				Type.String({ description: "Path to kernel.json (e.g., ~/kernels/my-kernel.json)" }),
+			name: Type.Optional(
+				Type.String({ description: "Registered kernel name to attach to" }),
 			),
-			set_default: Type.Optional(
-				Type.Boolean({ description: "Use this connection file for subsequent calls (default: true)" }),
+			path: Type.Optional(
+				Type.String({ description: "Path to an external kernel.json (e.g., ~/kernels/my-kernel.json)" }),
 			),
 		}),
-		async execute(_toolCallId, params, signal, _onUpdate, _ctx) {
+		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
 			try {
 				const cfg = loadConfig();
-				// Some models include a leading @ in path arguments — strip it.
-				const connectionFile = (params.path?.replace(/^@/, "") ?? cfg.kernel_connection_file) || "";
 
-				if (!connectionFile) {
-					throw new Error("❌ No kernel connection file specified. Provide path argument or configure kernel_connection_file in cfg.json.");
+				// 1) By name → attach to a registered kernel
+				if (params.name) {
+					const meta = readMeta(params.name);
+					if (!meta) {
+						throw new Error(`No kernel named '${params.name}' in the registry. Use kernel_list to see registered kernels.`);
+					}
+					await ensureBridgeRunning(params.name);
+					connectedName = params.name;
+					return {
+						content: [{ type: "text", text: `✅ Connected to kernel '${params.name}' (${meta.kernel_file})` }],
+						details: { name: params.name, kernel_file: meta.kernel_file },
+					};
 				}
 
-				const data = await serverPost("/kernel/connect", {
-					connection_file: connectionFile,
-					set_default: params.set_default ?? true,
-				}, { signal });
-
-				// Update config if path was provided
-				if (params.path && params.set_default !== false) {
-					const updatedCfg: Config = { ...cfg, kernel_connection_file: connectionFile };
-					saveConfig(updatedCfg);
+				// 2) By path → external kernel (on-demand bridge, auto name)
+				if (params.path) {
+					const connectionFile = expandUser(params.path.replace(/^@/, ""));
+					if (!existsSync(connectionFile)) {
+						throw new Error(`Kernel connection file not found: ${connectionFile}`);
+					}
+					const name = `ext-${slugify(basename(connectionFile))}-${Date.now()}`;
+					mkdirSync(kernelDir(name), { recursive: true });
+					const authToken = cfg.auth_token || randomBytes(16).toString("hex");
+					const port = await findFreePort();
+					const bridgeProc = spawnBridge(name, connectionFile, port, authToken);
+					await waitForHealth(port, BRIDGE_START_TIMEOUT_MS);
+					writeMeta(name, {
+						name,
+						kernel_pid: 0,
+						bridge_pid: bridgeProc.pid ?? null,
+						bridge_port: port,
+						kernel_file: connectionFile,
+						python: "",
+						cwd: "",
+						started_at: "",
+						started_by: process.env.PI_SESSION_ID ?? "unknown",
+						external: true,
+						auth_token: authToken,
+					});
+					connectedName = name;
+					return {
+						content: [{ type: "text", text: `✅ Connected to external kernel via bridge '${name}' (${connectionFile})` }],
+						details: { name, kernel_file: connectionFile, external: true },
+					};
 				}
 
+				// 3) Neither → default_connect (name first, then path)
+				const dflt = cfg.default_connect;
+				if (!dflt) {
+					throw new Error("No kernel name or path provided and no default_connect configured in cfg.json.");
+				}
+				if (readMeta(dflt)) {
+					await ensureBridgeRunning(dflt);
+					connectedName = dflt;
+					return {
+						content: [{ type: "text", text: `✅ Connected to kernel '${dflt}' (default_connect)` }],
+						details: { name: dflt },
+					};
+				}
+				const connectionFile = expandUser(dflt);
+				if (!existsSync(connectionFile)) {
+					throw new Error(`default_connect '${dflt}' is neither a registered kernel name nor an existing kernel.json path.`);
+				}
+				const name = `ext-${slugify(basename(connectionFile))}-${Date.now()}`;
+				mkdirSync(kernelDir(name), { recursive: true });
+				const authToken = cfg.auth_token || randomBytes(16).toString("hex");
+				const port = await findFreePort();
+				const bridgeProc = spawnBridge(name, connectionFile, port, authToken);
+				await waitForHealth(port, BRIDGE_START_TIMEOUT_MS);
+				writeMeta(name, {
+					name,
+					kernel_pid: 0,
+					bridge_pid: bridgeProc.pid ?? null,
+					bridge_port: port,
+					kernel_file: connectionFile,
+					python: "",
+					cwd: "",
+					started_at: "",
+					started_by: process.env.PI_SESSION_ID ?? "unknown",
+					external: true,
+					auth_token: authToken,
+				});
+				connectedName = name;
 				return {
-					content: [{ type: "text", text: `✅ Connected to kernel: ${data.connected_file}` }],
-					details: data,
+					content: [{ type: "text", text: `✅ Connected to external kernel via bridge '${name}' (default_connect path)` }],
+					details: { name, kernel_file: connectionFile, external: true },
 				};
 			} catch (err) {
 				throw new Error(`❌ ${errMsg(err)}`);
@@ -432,8 +664,7 @@ export default function (pi: ExtensionAPI) {
 		label: "Kernel Run Python",
 		description:
 			"Execute Python code in the connected kernel and return captured output. " +
-			"Output is truncated to ~20000 chars by default; use kernel_get_output to retrieve full output. " +
-			"The kernel must already be connected (via kernel_connect).",
+			"Output is truncated to ~20000 chars by default; use kernel_get_output to retrieve full output.",
 		promptSnippet: "Execute Python code in the kernel",
 		promptGuidelines: [
 			"Use kernel_run_python to execute Python code when you need the kernel state (variables, imports) to persist across calls.",
@@ -448,14 +679,14 @@ export default function (pi: ExtensionAPI) {
 		}),
 		async execute(_toolCallId, params, signal, onUpdate, _ctx) {
 			try {
+				const name = requireConnectedName();
 				onUpdate?.({ content: [{ type: "text", text: "⏳ Executing in kernel…" }], details: undefined });
-				const data = await serverPost("/kernel/run-code", {
+				const data = await kernelPost(name, "/kernel/run-code", {
 					code: params.code,
 					timeout_s: params.timeout_s,
 				}, { signal, timeoutS: params.timeout_s });
-				const truncated = data.truncated;
 				let text = data.output as string;
-				if (truncated) {
+				if (data.truncated) {
 					text += "\n\n⚠️ Output was truncated. Use kernel_get_output to retrieve the full output.";
 				}
 				return {
@@ -475,9 +706,8 @@ export default function (pi: ExtensionAPI) {
 		name: "kernel_eval_expr",
 		label: "Kernel Eval Expression",
 		description:
-			"Evaluate a Python expression in the kernel and return its text/plain result. " +
-			"Use this for quick checks (variables, types, simple computations) without polluting kernel history. " +
-			"The kernel must already be connected (via kernel_connect).",
+			"Evaluate a Python expression in the connected kernel and return its text/plain result. " +
+			"Use this for quick checks without polluting kernel history.",
 		promptSnippet: "Evaluate a Python expression",
 		promptGuidelines: [
 			"Use kernel_eval_expr for lightweight expression evaluation (checking variable values, types, quick math) instead of kernel_run_python.",
@@ -491,7 +721,8 @@ export default function (pi: ExtensionAPI) {
 		}),
 		async execute(_toolCallId, params, signal, _onUpdate, _ctx) {
 			try {
-				const data = await serverPost("/kernel/eval-expr", {
+				const name = requireConnectedName();
+				const data = await kernelPost(name, "/kernel/eval-expr", {
 					expr: params.expr,
 					timeout_s: params.timeout_s,
 				}, { signal, timeoutS: params.timeout_s });
@@ -512,7 +743,7 @@ export default function (pi: ExtensionAPI) {
 		name: "kernel_interrupt",
 		label: "Kernel Interrupt",
 		description:
-			"Interrupt the currently running kernel (sends SIGINT). " +
+			"Interrupt the currently running kernel (sends SIGINT via the control channel). " +
 			"Use this when a previous kernel_run_python call is stuck or taking too long.",
 		promptSnippet: "Interrupt the kernel",
 		promptGuidelines: [
@@ -522,7 +753,8 @@ export default function (pi: ExtensionAPI) {
 		parameters: Type.Object({}),
 		async execute(_toolCallId, _params, signal, _onUpdate, _ctx) {
 			try {
-				await serverPost("/kernel/interrupt", {}, { signal });
+				const name = requireConnectedName();
+				await kernelPost(name, "/kernel/interrupt", {}, { signal });
 				return {
 					content: [{ type: "text", text: "🛑 Kernel interrupted" }],
 					details: {},
@@ -557,7 +789,8 @@ export default function (pi: ExtensionAPI) {
 		}),
 		async execute(_toolCallId, params, signal, _onUpdate, _ctx) {
 			try {
-				const data = await serverPost("/kernel/get-output", {
+				const name = requireConnectedName();
+				const data = await kernelPost(name, "/kernel/get-output", {
 					start: params.start ?? 0,
 					limit: params.limit ?? 4000,
 				}, { signal });
@@ -579,91 +812,81 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// -----------------------------------------------------------------------
-	// 7. kernel_stop
+	// 7. kernel_list
 	// -----------------------------------------------------------------------
-	const kernelStopTool = defineTool({
-		name: "kernel_stop",
-		label: "Kernel Stop",
+	const kernelListTool = defineTool({
+		name: "kernel_list",
+		label: "Kernel List",
 		description:
-			"Stop a kernel that was created by Pi. " +
-			"No-op if the kernel was not auto-created (e.g., user started it manually).",
-		promptSnippet: "Stop the kernel",
+			"List all kernels in the registry (~/.ipy/kernels/). Dead kernels are pruned (their bridge reaped). " +
+			"Kernels are persistent — stop them with kernel_stop.",
+		promptSnippet: "List registered kernels",
 		promptGuidelines: [
-			"Use kernel_stop only to stop a kernel that was started by kernel_start.",
-			"Does nothing if the kernel was not created by Pi.",
+			"Use kernel_list to see which kernels exist, then kernel_connect by name or kernel_stop to clean up.",
 		],
-		executionMode: "sequential",
 		parameters: Type.Object({}),
-		async execute(_toolCallId, _params, signal, _onUpdate, _ctx) {
+		async execute(_toolCallId, _params, _signal, _onUpdate, _ctx) {
 			try {
-				const cfg = loadConfig();
+				const rows: {
+					name: string;
+					python: string;
+					cwd: string;
+					kernel_pid: number;
+					bridge_port: number;
+					started_at: string;
+					started_by: string;
+					external: boolean;
+					connected: boolean;
+				}[] = [];
+				let pruned = 0;
 
-				if (!cfg.kernel_auto_created) {
-					return {
-						content: [{ type: "text", text: "ℹ️ Kernel was not created by Pi. Use kernel_stop only for Pi-created kernels." }],
-						details: {},
-					};
-				}
-
-				if (!cfg.kernel_pid) {
-					throw new Error("⚠️ kernel_auto_created is true but kernel_pid is null.");
-				}
-
-				const savedPid = cfg.kernel_pid;
-				const kernelFile = cfg.kernel_connection_file;
-				let shutdownMethod = "process kill";
-
-				// 1. Try graceful shutdown via the kernel's control channel
-				try {
-					await serverPost("/kernel/shutdown", {}, { signal });
-					shutdownMethod = "graceful shutdown";
-					// Give the kernel a moment to exit cleanly
-					await new Promise<void>((r) => setTimeout(r, 500));
-				} catch {
-					// Server or kernel not reachable — fall through to process kill
-				}
-
-				// 2. Kill the tracked kernel process if we have it
-				if (kernelProcess) {
-					try { kernelProcess.kill(); } catch { /* already dead */ }
-					kernelProcess = null;
-				}
-
-				// 3. Fallback: signal the saved PID only if it is still alive AND
-				//    its start time matches what we captured at spawn — never a
-				//    recycled PID.
-				const isAlive = (pid: number): boolean => {
-					try { process.kill(pid, 0); return true; } catch { return false; }
-				};
-				if (isAlive(savedPid)) {
-					const nowStart = await procStartTime(savedPid);
-					if (kernelStartedAt && nowStart && nowStart === kernelStartedAt) {
-						try { process.kill(savedPid, "SIGKILL"); } catch { /* already dead */ }
+				for (const name of listKernelNames()) {
+					const meta = readMeta(name);
+					if (!meta) continue;
+					const alive = meta.external
+						? await bridgeHealthy(meta.bridge_port)
+						: await kernelIsAlive(meta);
+					if (alive) {
+						rows.push({
+							name,
+							python: meta.python || "(default)",
+							cwd: meta.cwd || "—",
+							kernel_pid: meta.kernel_pid,
+							bridge_port: meta.bridge_port,
+							started_at: meta.started_at || "—",
+							started_by: meta.started_by || "—",
+							external: meta.external,
+							connected: name === connectedName,
+						});
+					} else {
+						// Reap the orphaned bridge, then prune the dead entry
+						if (meta.bridge_pid && pidAlive(meta.bridge_pid)) {
+							try { process.kill(meta.bridge_pid, "SIGKILL"); } catch { /* gone */ }
+						}
+						deleteKernelDir(name);
+						if (connectedName === name) connectedName = null;
+						pruned++;
 					}
 				}
-				kernelStartedAt = null;
 
-				// 4. Clean up the kernel connection file
-				if (kernelFile) {
-					try {
-						const expanded = expandUser(kernelFile);
-						if (existsSync(expanded)) {
-							unlinkSync(expanded);
-						}
-					} catch { /* file may not exist or permissions issue */ }
+				rows.sort((a, b) => a.name.localeCompare(b.name));
+				const lines: string[] = [];
+				lines.push(`📦 Kernels (${rows.length} live${pruned ? `, ${pruned} pruned` : ""})`);
+				if (rows.length === 0) {
+					lines.push("(none — use kernel_start to create one)");
+				} else {
+					lines.push("");
+					lines.push("  NAME            PYTHON     PID       PORT   STARTED AT            EXTERNAL  CWD");
+					for (const r of rows) {
+						const marker = r.connected ? "→" : " ";
+						lines.push(
+							`${marker} ${r.name.padEnd(16)} ${r.python.padEnd(10)} ${String(r.kernel_pid).padEnd(8)} ${String(r.bridge_port).padEnd(6)} ${r.started_at.padEnd(21)} ${r.external ? "yes" : "no"}       ${r.cwd}`,
+						);
+					}
 				}
-
-				// Update config
-				const updatedCfg: Config = {
-					...cfg,
-					kernel_auto_created: false,
-					kernel_pid: null,
-				};
-				saveConfig(updatedCfg);
-
 				return {
-					content: [{ type: "text", text: `✅ Kernel stopped (PID ${savedPid}, ${shutdownMethod})` }],
-					details: { pid: savedPid, method: shutdownMethod },
+					content: [{ type: "text", text: lines.join("\n") }],
+					details: { rows, pruned },
 				};
 			} catch (err) {
 				throw new Error(`❌ ${errMsg(err)}`);
@@ -672,53 +895,144 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// -----------------------------------------------------------------------
-	// 8. kernel_status
+	// 8. kernel_stop
+	// -----------------------------------------------------------------------
+	const kernelStopTool = defineTool({
+		name: "kernel_stop",
+		label: "Kernel Stop",
+		description:
+			"Stop a kernel (and its bridge) by name, by connection-file path, or the currently connected kernel. " +
+			"External kernels: removes only our bridge unless kill_external is true.",
+		promptSnippet: "Stop a kernel",
+		promptGuidelines: [
+			"Use kernel_stop to stop a kernel by name (see kernel_list), or with no args to stop the connected kernel.",
+		],
+		executionMode: "sequential",
+		parameters: Type.Object({
+			name: Type.Optional(
+				Type.String({ description: "Registered kernel name to stop" }),
+			),
+			path: Type.Optional(
+				Type.String({ description: "Connection-file path of the kernel to stop" }),
+			),
+			kill_external: Type.Optional(
+				Type.Boolean({ description: "Also signal the external kernel's process (default: false)" }),
+			),
+		}),
+		async execute(_toolCallId, params, signal, _onUpdate, _ctx) {
+			try {
+				let name: string | null = null;
+				if (params.name) {
+					if (!readMeta(params.name)) {
+						throw new Error(`No kernel named '${params.name}' in the registry.`);
+					}
+					name = params.name;
+				} else if (params.path) {
+					const f = expandUser(params.path.replace(/^@/, ""));
+					name = findKernelByFile(f);
+					if (!name) {
+						throw new Error(`No registered kernel for connection file: ${f}`);
+					}
+				} else {
+					name = connectedName;
+					if (!name) {
+						throw new Error("No kernel connected. Pass name or path, or connect first.");
+					}
+				}
+
+				const meta = readMeta(name);
+				if (!meta) {
+					throw new Error(`Kernel '${name}' disappeared from the registry.`);
+				}
+
+				// External kernel: we never started it — remove our bridge only.
+				if (meta.external) {
+					if (params.kill_external && meta.kernel_pid && pidAlive(meta.kernel_pid)) {
+						try { process.kill(meta.kernel_pid, "SIGKILL"); } catch { /* gone */ }
+					}
+					if (meta.bridge_pid && pidAlive(meta.bridge_pid)) {
+						try { process.kill(meta.bridge_pid, "SIGKILL"); } catch { /* gone */ }
+					}
+					deleteKernelDir(name);
+					if (connectedName === name) connectedName = null;
+					return {
+						content: [{ type: "text", text: `✅ Removed bridge for external kernel '${name}'${params.kill_external ? " (kernel signaled)" : " (kernel left running)"}` }],
+						details: { name, external: true },
+					};
+				}
+
+				// Graceful shutdown via the kernel's own bridge
+				let method = "process kill";
+				try {
+					await kernelPost(name, "/kernel/shutdown", {}, { signal });
+					method = "graceful shutdown";
+					await sleep(500);
+				} catch {
+					// bridge unreachable — fall through to process kill
+				}
+
+				// Stop the bridge (best-effort /shutdown, then hard kill)
+				try {
+					await kernelPost(name, "/shutdown", {}, { signal });
+				} catch {
+					/* bridge may already be gone */
+				}
+				if (meta.bridge_pid && pidAlive(meta.bridge_pid)) {
+					try { process.kill(meta.bridge_pid, "SIGKILL"); } catch { /* gone */ }
+				}
+
+				// Kill the kernel only if still alive and identity-verified
+				if (await kernelIsAlive(meta)) {
+					try { process.kill(meta.kernel_pid, "SIGKILL"); } catch { /* gone */ }
+				}
+
+				deleteKernelDir(name);
+				if (connectedName === name) connectedName = null;
+				return {
+					content: [{ type: "text", text: `✅ Kernel '${name}' stopped (PID ${meta.kernel_pid}, ${method})` }],
+					details: { name, pid: meta.kernel_pid, method },
+				};
+			} catch (err) {
+				throw new Error(`❌ ${errMsg(err)}`);
+			}
+		},
+	});
+
+	// -----------------------------------------------------------------------
+	// 9. kernel_status
 	// -----------------------------------------------------------------------
 	const kernelStatusTool = defineTool({
 		name: "kernel_status",
 		label: "Kernel Status",
 		description:
-			"Show the current kernel connection status, port, and configured connection file. " +
-			"Use this to check whether the server and kernel are reachable.",
-		promptSnippet: "Show kernel and server status",
+			"Show the connected kernel (name, bridge health, PID, Python, cwd) and a registry summary. " +
+			"Use kernel_list for the full registry.",
+		promptSnippet: "Show kernel status",
 		promptGuidelines: [
-			"Use kernel_status to check whether the kernel server is running and which connection file is in use.",
+			"Use kernel_status to check which kernel this session is connected to and whether its bridge is up.",
 		],
 		parameters: Type.Object({}),
 		async execute(_toolCallId, _params, _signal, _onUpdate, _ctx) {
 			try {
-				const cfg = loadConfig();
-
-				let serverRunning = false;
-				let kernelConnected = false;
-				try {
-					const data = await serverGet("/kernel/status") as { connected: boolean };
-					serverRunning = true;
-					kernelConnected = data.connected;
-				} catch {
-					// Server unreachable — both remain false
-				}
-
 				const lines: string[] = [];
-				lines.push(`🔌 Server: ${serverRunning ? "✅ running" : "❌ not running"}`);
-				lines.push(`🔗 Kernel: ${kernelConnected ? "✅ connected" : "❌ not connected"}`);
-				lines.push(`📁 Connection file: ${cfg.kernel_connection_file || "(not set)"}`);
-				lines.push(`🤖 Auto-created: ${cfg.kernel_auto_created ? "yes" : "no"}`);
-				if (cfg.kernel_pid) {
-					lines.push(` PID: ${cfg.kernel_pid}`);
+				const meta = connectedName ? readMeta(connectedName) : null;
+				if (meta) {
+					const bridgeUp = await bridgeHealthy(meta.bridge_port);
+					lines.push(`🔗 Connected kernel: ${meta.name}`);
+					lines.push(`   Bridge: ${bridgeUp ? "✅ up" : "❌ down"} (port ${meta.bridge_port})`);
+					lines.push(`   Kernel PID: ${meta.kernel_pid}${meta.external ? " (external)" : ""}`);
+					lines.push(`   Python: ${meta.python || "(default)"}`);
+					lines.push(`   Cwd: ${meta.cwd || "—"}`);
+					lines.push(`   Started: ${meta.started_at || "—"}`);
+					lines.push(`   Started by: ${meta.started_by || "—"}`);
+				} else {
+					lines.push("🔗 No kernel connected. Use kernel_start or kernel_connect first.");
 				}
-				lines.push(`📝 Log files:`);
-				lines.push(`   Kernel: ${cfg.kernel_log_file}`);
-				lines.push(`   Server: ${cfg.server_log_file}`);
-
-				if (!kernelConnected && cfg.kernel_connection_file) {
-					lines.push("");
-					lines.push("⚠️  Not connected. Make sure the kernel is running.");
-				}
-
+				const names = listKernelNames();
+				lines.push(`📦 Registry: ${names.length} kernel(s) in ${KERNELS_DIR}`);
 				return {
 					content: [{ type: "text", text: lines.join("\n") }],
-					details: { serverRunning, kernelConnected, ...cfg },
+					details: { connected: meta?.name ?? null, registryCount: names.length },
 				};
 			} catch (err) {
 				throw new Error(`❌ ${errMsg(err)}`);
@@ -732,6 +1046,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool(kernelEvalExprTool);
 	pi.registerTool(kernelInterruptTool);
 	pi.registerTool(kernelGetOutputTool);
+	pi.registerTool(kernelListTool);
 	pi.registerTool(kernelStopTool);
 	pi.registerTool(kernelStatusTool);
 }

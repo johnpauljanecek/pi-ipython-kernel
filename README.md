@@ -1,6 +1,6 @@
 # ipyforge-kernel
 
-Pi extension for controlling an IPython kernel via HTTP. Communicates with a FastAPI server that wraps `jupyter_client.BlockingKernelClient`.
+Pi extension for controlling IPython kernels via HTTP. Each kernel is a **persistent named resource** with its own companion FastAPI bridge (one per kernel) that wraps `jupyter_client.BlockingKernelClient`. Kernels live in `~/.ipy/kernels/<name>/` and outlive pi sessions.
 
 ## Installation
 
@@ -29,75 +29,83 @@ pi -e git:github.com/johnjanecek/ipyforge-kernel
 
 | Tool | Description |
 |------|-------------|
-| `kernel_start` | Start a new IPython kernel |
-| `kernel_connect` | Connect to a kernel (path argument or cfg.json) |
-| `kernel_run_python` | Execute Python code in the kernel |
+| `kernel_start` | Start a new named IPython kernel (persistent) |
+| `kernel_connect` | Attach to a kernel by name, or an external kernel by path |
+| `kernel_run_python` | Execute Python code in the connected kernel |
 | `kernel_eval_expr` | Evaluate a Python expression |
 | `kernel_interrupt` | Interrupt a stuck kernel |
 | `kernel_get_output` | Retrieve cached output slices |
-| `kernel_stop` | Stop a Pi-created kernel |
-| `kernel_status` | Show server and kernel status |
+| `kernel_list` | List kernels in the registry (prunes dead entries) |
+| `kernel_stop` | Stop a kernel and its bridge |
+| `kernel_status` | Show the connected kernel + registry summary |
 
 ## Quick Start
-
-### 1. Install IPython tool
-
-```bash
-uv tool install ipython --with ipykernel --with jupyter-console
-```
-
-### 2. Install this package
 
 ```bash
 pi install /path/to/ipython_package
 ```
 
-### 3. Start a kernel
-
 ```
-kernel_start
-```
-
-### 4. Connect and run code
-
-```
-kernel_connect
+kernel_start { "name": "data" }
 kernel_run_python { "code": "print('hello from kernel')" }
+kernel_eval_expr { "expr": "1 + 1" }
+kernel_list
+kernel_stop { "name": "data" }
 ```
 
-## Server Setup
+## Lifecycle
 
-The server starts internally on first tool call. Log output goes to:
-- Kernel: `~/.ipy/kernel.log`
-- Server: `~/.ipy/server.log`
+- **Kernels are persistent named resources.** They survive pi sessions, `/quit`, and terminal close — they are spawned detached (own process group).
+- A kernel is stopped **only** by `kernel_stop`, a crash, or a reboot. Pi session end never kills kernels.
+- **No idle timeout** — cleanup is manual via `kernel_list` + `kernel_stop` (everything is indexed in one place: `~/.ipy/kernels/`).
+- Each kernel has a **companion bridge** (its own free port, its own output cache) that lives and dies with it. Two pi sessions can attach to the same kernel by name.
+- **tmux is not required for kernel persistence.** It is only useful for keeping *pi itself* running across ssh disconnects / terminal closes.
 
-Monitor with:
-```bash
-tail -f ~/.ipy/kernel.log
+## Registry
+
 ```
+~/.ipy/kernels/<name>/
+├── kernel.json    # ipykernel connection file
+├── meta.json      # kernel_pid, bridge_port, python, cwd, started_at, …
+├── kernel.log     # kernel stdout/stderr
+└── bridge.log     # bridge stdout/stderr
+```
+
+`kernel_list` prunes dead kernels and reaps their orphaned bridges.
 
 ## Configuration
 
-Create `cfg.json` in the package root (see `cfg.json.example`):
+User preferences live in `cfg.json` in the package root (see `cfg.json.example`):
 
 ```json
 {
-  "port": 9123,
-  "kernel_connection_file": "~/kernels/ipyforge-kernel.json",
-  "default_cwd": "/Users/johnjanecek",
-  "kernel_log_file": "~/.ipy/kernel.log",
-  "server_log_file": "~/.ipy/server.log"
+  "python": "",
+  "default_cwd": "~/",
+  "max_output_chars": 20000,
+  "default_timeout_s": 60,
+  "kernel_channel_timeout_s": 5,
+  "default_connect": "",
+  "auth_token": ""
 }
 ```
+
+- `python` — interpreter for `kernel_start`: `""` (default uv ipython tool), `"project"` (project env), a version spec (`"3.11"`), or an interpreter/venv path. Always resolved via uv.
+- `default_connect` — kernel name or path used by `kernel_connect` with no args.
+- `auth_token` — optional bridge auth token (auto-generated per kernel if empty).
+
+## Known limitations
+
+- The bridge binds `127.0.0.1` with no auth by default (a per-kernel token is generated unless `auth_token` is set). Any local process can reach a bridge if it knows the token and port.
+- The registry is per-user at `~/.ipy/kernels/`.
+
+## Requirements
+
+- `uv` installed and available in PATH.
+- The bridge self-provisions its dependencies (`uv run --with fastapi --with uvicorn --with jupyter_client --with pyzmq --with pydantic`); no `.venv` required.
+- Kernels run via uv (`uv tool run --from ipython --with ipykernel …` for the default interpreter).
 
 ## Documentation
 
 - [uv tool environment setup](docs/uv-tool-env-setup.md)
 - [Kitty remote control](docs/useful_kitty.md)
 - [ipy skill](skills/ipy/SKILL.md)
-
-## Requirements
-
-- `uv` installed
-- `ipython` tool installed with `ipykernel` and `jupyter-console`
-- Python: `fastapi`, `uvicorn`, `jupyter_client`, `pydantic`

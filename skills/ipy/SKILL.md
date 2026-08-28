@@ -1,84 +1,84 @@
 ---
 name: ipy
-description: Pi skill for controlling an IPython kernel via HTTP. Use to execute Python code in a persistent kernel, start/stop kernels, and manage kernel connections.
+description: Pi skill for controlling IPython kernels via HTTP. Use to execute Python code in persistent named kernels, start/stop kernels, and manage the kernel registry.
 ---
 
 # ipy Skill
 
-Pi skill for controlling an IPython kernel via HTTP. The extension communicates with a local FastAPI server that wraps `jupyter_client.BlockingKernelClient`.
+Pi skill for controlling IPython kernels. Each kernel is a **persistent named resource** with its own companion FastAPI bridge (one bridge per kernel, never shared). Kernels are registered under `~/.ipy/kernels/<name>/` and outlive pi sessions.
 
 ## Tools
 
 | Tool | Description |
 |------|-------------|
-| `kernel_start` | Start a new IPython kernel via execa. Updates cfg.json with connection file and PID. |
-| `kernel_connect` | Connect to a kernel. Use path argument or cfg.json. |
-| `kernel_run_python` | Execute Python code in the kernel. Output may be truncated; use `kernel_get_output` for full output. |
-| `kernel_eval_expr` | Evaluate a Python expression. Use for quick checks without polluting history. |
-| `kernel_interrupt` | Interrupt a stuck kernel. |
+| `kernel_start` | Start a new named IPython kernel (persistent). Optional `name`, `python` env, `cwd`. |
+| `kernel_connect` | Attach to a kernel by `name`, or an external kernel via `path`. |
+| `kernel_run_python` | Execute Python code in the connected kernel. Output may be truncated; use `kernel_get_output`. |
+| `kernel_eval_expr` | Evaluate a Python expression. Quick checks without polluting history. |
+| `kernel_interrupt` | Interrupt a stuck kernel (control channel — works mid-execution). |
 | `kernel_get_output` | Retrieve cached output slices when truncated. |
-| `kernel_stop` | Stop a Pi-created kernel. No-op for user-created kernels. |
-| `kernel_status` | Show server and kernel connection status. |
+| `kernel_list` | List all kernels in the registry; prunes dead entries. |
+| `kernel_stop` | Stop a kernel (and its bridge) by name/path, or the connected one. |
+| `kernel_status` | Show the connected kernel + registry summary. |
+
+## Lifecycle
+
+- **Kernels persist** across pi sessions, `/quit`, and terminal close (spawned detached).
+- They are stopped **only** by `kernel_stop`, a crash, or a reboot — never by session end.
+- **No idle timeout.** Clean up manually via `kernel_list` + `kernel_stop`.
+- Each kernel has a **companion bridge** (its own port, its own output cache) that lives and dies with it.
+- tmux is **not** required for persistence — it is only needed to keep *pi itself* alive across ssh disconnects.
 
 ## Configuration
 
-Configuration is in `cfg.json` in the package root. Use `~/` paths — they are automatically expanded.
+User preferences live in `cfg.json` in the package root. `~/` paths are auto-expanded.
 
 ```json
 {
-  "port": 9123,
-  "kernel_connection_file": "~/kernels/ipyforge-kernel.json",
-  "max_output_chars": 20000,
-  "default_timeout_s": 30,
-  "kernel_channel_timeout_s": 5,
+  "python": "",
   "default_cwd": "~/",
-  "kernel_auto_created": false,
-  "kernel_pid": null,
-  "kernel_log_file": "~/.ipy/kernel.log",
-  "server_log_file": "~/.ipy/server.log"
+  "max_output_chars": 20000,
+  "default_timeout_s": 60,
+  "kernel_channel_timeout_s": 5,
+  "default_connect": "",
+  "auth_token": ""
 }
 ```
 
 **Fields**:
-- `port` — server port (default: 9123)
-- `kernel_connection_file` — path to kernel connection file (`~` expanded)
-- `max_output_chars` — max chars before output truncation (default: 20000)
-- `default_timeout_s` — default timeout for code execution (default: 30)
-- `kernel_channel_timeout_s` — ZMQ socket timeout for kernel communication (default: 5)
-- `default_cwd` — working directory for starting kernels (`~` expanded)
-- `kernel_auto_created` — whether Pi created the kernel (true = can stop, false = user-created)
-- `kernel_pid` — process ID if Pi created the kernel
-- `kernel_log_file` — kernel stdout/stderr log (`~` expanded)
-- `server_log_file` — server stdout/stderr log (`~` expanded)
+- `python` — default interpreter for `kernel_start`: `""` (default uv ipython tool), `"project"` (project env), a version spec (e.g. `"3.11"`), or an interpreter/venv path.
+- `default_cwd` — working directory for new kernels (`~` expanded).
+- `max_output_chars` — output truncation limit (default: 20000).
+- `default_timeout_s` — default code-execution timeout (default: 60).
+- `kernel_channel_timeout_s` — ZMQ socket timeout (default: 5).
+- `default_connect` — kernel name or path used by `kernel_connect` with no args.
+- `auth_token` — optional bridge auth token (auto-generated per kernel if empty).
 
 ## Workflow
 
-### Start a new kernel
+### Start a kernel
 
 ```
 kernel_start
 ```
 
-Or with a specific working directory:
+With a name and a Python interpreter:
 
 ```
-kernel_start { "cwd": "/path/to/project" }
+kernel_start { "name": "data", "python": "3.11", "cwd": "/path/to/project" }
 ```
 
-The kernel runs via execa with output written to `kernel_log_file`. Monitor with:
+Kernel logs: `tail -f ~/.ipy/kernels/<name>/kernel.log`.
 
-```bash
-tail -f ~/.ipy/kernel.log
+### List / attach / connect
+
+```
+kernel_list
+kernel_connect { "name": "data" }
 ```
 
-### Connect to existing kernel
+External kernel (we didn't start it — only a bridge is added):
 
-**Option A**: Use cfg.json (kernel already configured):
-```
-kernel_connect
-```
-
-**Option B**: Provide path argument (user-created kernel):
 ```
 kernel_connect { "path": "~/kernels/my-kernel.json" }
 ```
@@ -89,17 +89,10 @@ kernel_connect { "path": "~/kernels/my-kernel.json" }
 kernel_run_python { "code": "print('hello from kernel')" }
 ```
 
-For large output:
-```
-kernel_run_python { "code": "..." }
-kernel_get_output { "start": 0, "limit": 4000 }
-```
+Large output — fetch in slices:
 
-**Example tool call:**
 ```
-kernel_run_python {
-  "code": "def hanoi(n, source=\"A\", target=\"C\", auxiliary=\"B\"):\n    if n == 1:\n        print(f\"Move disk 1 from {source} to {target}\")\n        return\n    hanoi(n - 1, source, auxiliary, target)\n    print(f\"Move disk {n} from {source} to {target}\")\n    hanoi(n - 1, auxiliary, target, source)\n\nprint(\"Towers of Hanoi - 3 disks:\")\nhanoi(3)"
-}
+kernel_get_output { "start": 0, "limit": 4000 }
 ```
 
 ### Quick expression eval
@@ -108,82 +101,38 @@ kernel_run_python {
 kernel_eval_expr { "expr": "len(data)" }
 ```
 
-### Interrupt stuck execution
+### Interrupt / stop / status
 
 ```
 kernel_interrupt
-```
-
-### Check status
-
-```
 kernel_status
+kernel_stop                 # stops the connected kernel
+kernel_stop { "name": "data" }
 ```
 
-Shows:
-- Server running/not running
-- Kernel connected/not connected
-- Connection file path
-- Auto-created flag
-- PID if Pi-created
-- Log file paths
+## Registry
 
-### Stop kernel
+Kernel state lives at `~/.ipy/kernels/<name>/`:
 
 ```
-kernel_stop
+~/.ipy/kernels/<name>/
+├── kernel.json    # ipykernel connection file
+├── meta.json      # kernel_pid, bridge_port, python, cwd, started_at, …
+├── kernel.log     # kernel stdout/stderr
+└── bridge.log     # bridge stdout/stderr
 ```
 
-Only works for Pi-created kernels. No-op for user-created kernels.
-
-Shuts down in four stages:
-1. Graceful Jupyter shutdown via control channel
-2. Kill tracked kernel process
-3. Kill process group (catches child Python processes)
-4. Clean up kernel connection file
-
-The shutdown method is reported in the output (`graceful shutdown` or `process kill`).
-
-## Log Monitoring
-
-Both kernel and server output are written to log files. Monitor with:
-
-```bash
-# Kernel logs
-tail -f ~/.ipy/kernel.log
-
-# Server logs
-tail -f ~/.ipy/server.log
-```
-
-The user is responsible for monitoring logs. If execution fails, check the log files for errors.
+`kernel_list` reaps dead kernels (and their orphaned bridges) automatically.
 
 ## Requirements
 
-- `uv` installed and available in PATH
-- `ipython` tool installed via `uv tool install ipython --with ipykernel`
-- Python packages: `fastapi`, `uvicorn`, `jupyter_client`, `ipykernel`, `jupyter_console`, `pydantic`, `pyzmq`
-
-Install IPython tool environment:
-
-```bash
-uv tool install ipython \
-  --with ipykernel \
-  --with jupyter-console
-```
-
-## Timeout Protection
-
-All HTTP requests to the server use a 10-second timeout via `AbortSignal`. If the server
-is unreachable, tools fail fast instead of hanging indefinitely.
-
-The server also sets ZMQ socket timeouts (`kernel_channel_timeout_s`, default 5s) on all
-kernel channels, so a stuck kernel won't block subsequent operations.
+- `uv` installed and available in PATH.
+- The bridge self-provisions its deps via `uv run --with fastapi --with uvicorn --with jupyter_client --with pyzmq --with pydantic` — no `.venv` needed.
+- Kernels use `uv` too: default `uv tool run --from ipython --with ipykernel …` (self-contained).
 
 ## Error Handling
 
 If a tool fails:
-1. Check `kernel_status` for server and kernel state
-2. Check log files for errors
-3. Ensure kernel is running (start with `kernel_start` or manually)
-4. Verify connection file path in cfg.json
+1. Check `kernel_status` and `kernel_list` for state.
+2. Check `~/.ipy/kernels/<name>/kernel.log` and `bridge.log`.
+3. Ensure a kernel is connected (`kernel_start` or `kernel_connect` first).
