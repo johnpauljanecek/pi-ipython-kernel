@@ -457,7 +457,7 @@ export default function (pi: ExtensionAPI) {
 				Type.String({ description: "Working directory for kernel (default: cfg.json default_cwd)" }),
 			),
 		}),
-		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			try {
 				const cfg = loadConfig();
 				const name = params.name ?? `kernel-${Date.now()}`;
@@ -517,7 +517,7 @@ export default function (pi: ExtensionAPI) {
 					python,
 					cwd: workingDir,
 					started_at: startedAt,
-					started_by: process.env.PI_SESSION_ID ?? "unknown",
+					started_by: ctx.sessionManager.getSessionId(),
 					external: false,
 					auth_token: authToken,
 				});
@@ -559,7 +559,7 @@ export default function (pi: ExtensionAPI) {
 				Type.String({ description: "Path to an external kernel.json (e.g., ~/kernels/my-kernel.json)" }),
 			),
 		}),
-		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			try {
 				const cfg = loadConfig();
 
@@ -598,7 +598,7 @@ export default function (pi: ExtensionAPI) {
 						python: "",
 						cwd: "",
 						started_at: "",
-						started_by: process.env.PI_SESSION_ID ?? "unknown",
+						started_by: ctx.sessionManager.getSessionId(),
 						external: true,
 						auth_token: authToken,
 					});
@@ -641,7 +641,7 @@ export default function (pi: ExtensionAPI) {
 					python: "",
 					cwd: "",
 					started_at: "",
-					started_by: process.env.PI_SESSION_ID ?? "unknown",
+					started_by: ctx.sessionManager.getSessionId(),
 					external: true,
 					auth_token: authToken,
 				});
