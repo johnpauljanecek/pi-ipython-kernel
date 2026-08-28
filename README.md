@@ -104,6 +104,33 @@ User preferences live in `cfg.json` in the package root (see `cfg.json.example`)
 - The bridge self-provisions its dependencies (`uv run --with fastapi --with uvicorn --with jupyter_client --with pyzmq --with pydantic`); no `.venv` required.
 - Kernels run via uv (`uv tool run --from ipython --with ipykernel …` for the default interpreter).
 
+## Testing
+
+Two suites cover the bridge and the extension's pure logic.
+
+### Node — extension logic (`npm test`)
+
+Unit tests for the pure helpers in `extensions/lib.ts`: the `kernel_start`
+spawn-command matrix, registry read/write/list/find, and PID liveness (including
+the start-time guard that prevents signaling a recycled PID).
+
+```bash
+npm test          # node --test "tests/*.test.ts"  (Node >= 22.6 for native TS)
+npm run typecheck # tsc --noEmit
+```
+
+### Python — bridge integration (`npm run test:bridge`)
+
+Spawns a real IPython kernel + its companion bridge and exercises every endpoint:
+run-code / eval-expr state persistence, the overall-deadline timeout, interrupt
+during a long run, the auth token, the output cache, and a BUG-09 socket-leak
+regression (many rapid requests on a single long-lived client).
+
+```bash
+uv sync --group dev      # once, to install pytest
+npm run test:bridge      # uv run pytest tests/test_bridge.py -v
+```
+
 ## Documentation
 
 - [uv tool environment setup](docs/uv-tool-env-setup.md)

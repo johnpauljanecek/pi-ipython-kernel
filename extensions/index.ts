@@ -24,24 +24,32 @@
 import { defineTool, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { execa } from "execa";
-import {
-	readFileSync,
-	writeFileSync,
-	existsSync,
-	mkdirSync,
-	renameSync,
-	rmSync,
-	readdirSync,
-} from "fs";
+import { readFileSync, existsSync, mkdirSync } from "fs";
 import { resolve, join, basename } from "path";
 import { homedir } from "os";
-import { createServer } from "net";
 import { randomBytes } from "crypto";
+import {
+	buildKernelCommand,
+	deleteKernelDir,
+	errMsg,
+	expandUser,
+	findFreePort,
+	findKernelByFile,
+	kernelDir,
+	kernelIsAlive,
+	listKernelNames,
+	pidAlive,
+	procStartTime,
+	readMeta,
+	slugify,
+	writeMeta,
+	KERNELS_DIR,
+	type KernelMeta,
+} from "./lib";
 
 const CONFIG_FILENAME = "cfg.json";
 const CONTROL_TIMEOUT_MS = 10_000;
 const TIMEOUT_MARGIN_S = 15;
-const KERNELS_DIR = join(homedir(), ".ipy", "kernels");
 const BRIDGE_START_TIMEOUT_MS = 30_000;
 const KERNEL_FILE_TIMEOUT_MS = 30_000;
 
@@ -49,23 +57,8 @@ const KERNEL_FILE_TIMEOUT_MS = 30_000;
 // Utilities
 // ---------------------------------------------------------------------------
 
-function expandUser(path: string): string {
-	if (path.startsWith("~/")) {
-		return resolve(homedir(), path.slice(2));
-	}
-	return path;
-}
-
-function errMsg(err: unknown): string {
-	return err instanceof Error ? err.message : String(err);
-}
-
 function sleep(ms: number): Promise<void> {
 	return new Promise<void>((r) => setTimeout(r, ms));
-}
-
-function slugify(s: string): string {
-	return s.replace(/[^\w.-]+/g, "-").replace(/^-+|-+$/g, "") || "kernel";
 }
 
 // ---------------------------------------------------------------------------
@@ -120,75 +113,6 @@ function getDefaultConfig(overrides: Partial<Config> = {}): Config {
 // Kernel registry (~/.ipy/kernels/<name>/)
 // ---------------------------------------------------------------------------
 
-interface KernelMeta {
-	name: string;
-	kernel_pid: number;
-	bridge_pid: number | null;
-	bridge_port: number;
-	kernel_file: string;
-	python: string;
-	cwd: string;
-	started_at: string;
-	started_by: string;
-	external: boolean;
-	auth_token: string;
-}
-
-function kernelDir(name: string): string {
-	return join(KERNELS_DIR, name);
-}
-
-function metaPath(name: string): string {
-	return join(kernelDir(name), "meta.json");
-}
-
-function readMeta(name: string): KernelMeta | null {
-	try {
-		return JSON.parse(readFileSync(metaPath(name), "utf-8")) as KernelMeta;
-	} catch {
-		return null;
-	}
-}
-
-function writeMeta(name: string, meta: KernelMeta): void {
-	const dir = kernelDir(name);
-	if (!existsSync(dir)) {
-		mkdirSync(dir, { recursive: true });
-	}
-	const finalPath = metaPath(name);
-	const tmpPath = `${finalPath}.tmp`;
-	writeFileSync(tmpPath, JSON.stringify(meta, null, 2), "utf-8");
-	renameSync(tmpPath, finalPath);
-}
-
-function deleteKernelDir(name: string): void {
-	try {
-		rmSync(kernelDir(name), { recursive: true, force: true });
-	} catch {
-		/* already gone */
-	}
-}
-
-function listKernelNames(): string[] {
-	try {
-		if (!existsSync(KERNELS_DIR)) return [];
-		return readdirSync(KERNELS_DIR, { withFileTypes: true })
-			.filter((d) => d.isDirectory())
-			.map((d) => d.name);
-	} catch {
-		return [];
-	}
-}
-
-function findKernelByFile(file: string): string | null {
-	const target = resolve(file);
-	for (const name of listKernelNames()) {
-		const meta = readMeta(name);
-		if (meta && resolve(meta.kernel_file) === target) return name;
-	}
-	return null;
-}
-
 async function waitForKernelFile(path: string, timeoutMs = KERNEL_FILE_TIMEOUT_MS): Promise<void> {
 	const deadline = Date.now() + timeoutMs;
 	while (Date.now() < deadline) {
@@ -204,32 +128,6 @@ async function waitForKernelFile(path: string, timeoutMs = KERNEL_FILE_TIMEOUT_M
 
 let connectedName: string | null = null;
 const bridgeStartPromises = new Map<string, Promise<number>>();
-
-function pidAlive(pid: number): boolean {
-	if (!pid || pid <= 0) return false;
-	try {
-		process.kill(pid, 0);
-		return true;
-	} catch {
-		return false;
-	}
-}
-
-async function procStartTime(pid: number): Promise<string | null> {
-	try {
-		const { stdout } = await execa("ps", ["-o", "lstart=", "-p", String(pid)], { reject: false });
-		return stdout.trim() || null;
-	} catch {
-		return null;
-	}
-}
-
-async function kernelIsAlive(meta: KernelMeta): Promise<boolean> {
-	if (!pidAlive(meta.kernel_pid)) return false;
-	if (!meta.started_at) return true;
-	const nowStart = await procStartTime(meta.kernel_pid);
-	return nowStart === meta.started_at;
-}
 
 async function stopBridge(meta: KernelMeta): Promise<void> {
 	// Graceful: /shutdown makes the actual python bridge os._exit(0). This is
@@ -256,19 +154,6 @@ async function stopBridge(meta: KernelMeta): Promise<void> {
 	}
 }
 
-function findFreePort(): Promise<number> {
-	return new Promise((res, rej) => {
-		const srv = createServer();
-		srv.unref();
-		srv.on("error", rej);
-		srv.listen(0, "127.0.0.1", () => {
-			const address = srv.address();
-			const port = typeof address === "object" && address ? address.port : 0;
-			srv.close(() => res(port));
-		});
-	});
-}
-
 async function bridgeHealthy(port: number): Promise<boolean> {
 	try {
 		await fetch(`http://127.0.0.1:${port}/health`, { signal: AbortSignal.timeout(2000) });
@@ -290,17 +175,6 @@ async function waitForHealth(port: number, timeoutMs: number): Promise<void> {
 // ---------------------------------------------------------------------------
 // Spawn helpers (detached, file-logged)
 // ---------------------------------------------------------------------------
-
-function buildKernelCommand(python: string, kernelFile: string): string[] {
-	if (!python) {
-		return ["tool", "run", "--from", "ipython", "--with", "ipykernel", "python", "-m", "ipykernel", "-f", kernelFile];
-	}
-	if (python === "project") {
-		return ["run", "--with", "ipykernel", "python", "-m", "ipykernel", "-f", kernelFile];
-	}
-	// Version spec (e.g. "3.11") or absolute interpreter/venv path
-	return ["run", "--isolated", "--python", python, "--with", "ipykernel", "python", "-m", "ipykernel", "-f", kernelFile];
-}
 
 function spawnKernel(kernelFile: string, python: string, cwd: string, logFile: string): ReturnType<typeof execa> {
 	const proc = execa("uv", buildKernelCommand(python, kernelFile), {
