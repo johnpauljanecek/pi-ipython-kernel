@@ -2,7 +2,7 @@
   "port": 9123,
   "kernel_connection_file": "~/kernels/ipyforge-kernel.json",
   "max_output_chars": 20000,
-  "default_timeout_s": 30,
+  "default_timeout_s": 60,
   "kernel_channel_timeout_s": 5,
   "default_cwd": "~/",
   "kernel_auto_created": false,

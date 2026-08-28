@@ -3,7 +3,7 @@
  *
  * Installed via: pi install /path/to/ipython_package
  *
- * Registers 7 custom tools that communicate with a local FastAPI server
+ * Registers 8 custom tools that communicate with a local FastAPI server
  * (ipyforge-kernel-server) wrapping jupyter_client.BlockingKernelClient.
  *
  * Server is started internally on first tool call.
@@ -20,7 +20,7 @@
  *   kernel_status       — show connection and server state
  */
 
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { defineTool, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { execa } from "execa";
 import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync } from "fs";
@@ -29,7 +29,8 @@ import { homedir } from "os";
 
 const SERVER = "http://127.0.0.1:9123";
 const CONFIG_FILENAME = "cfg.json";
-const REQUEST_TIMEOUT_MS = 10_000;
+const CONTROL_TIMEOUT_MS = 10_000;
+const TIMEOUT_MARGIN_S = 15;
 const SERVER_START_TIMEOUT_MS = 15_000;
 
 // ---------------------------------------------------------------------------
@@ -41,6 +42,10 @@ function expandUser(path: string): string {
 		return resolve(homedir(), path.slice(2));
 	}
 	return path;
+}
+
+function errMsg(err: unknown): string {
+	return err instanceof Error ? err.message : String(err);
 }
 
 // ---------------------------------------------------------------------------
@@ -85,7 +90,7 @@ function getDefaultConfig(overrides: Partial<Config> = {}): Config {
 		port: 9123,
 		kernel_connection_file: "",
 		max_output_chars: 20000,
-		default_timeout_s: 30,
+		default_timeout_s: 60,
 		default_cwd: homedir(),
 		kernel_auto_created: false,
 		kernel_pid: null,
@@ -107,6 +112,16 @@ function saveConfig(cfg: Config): void {
 let serverStarted = false;
 let serverProcess: ReturnType<typeof execa> | null = null;
 let kernelProcess: ReturnType<typeof execa> | null = null;
+let kernelStartedAt: string | null = null;
+
+async function procStartTime(pid: number): Promise<string | null> {
+	try {
+		const { stdout } = await execa("ps", ["-o", "lstart=", "-p", String(pid)], { reject: false });
+		return stdout.trim() || null;
+	} catch {
+		return null;
+	}
+}
 
 async function killStaleServer(port: number): Promise<void> {
 	// Kill the tracked process if we have one
@@ -172,7 +187,7 @@ async function ensureServerRunning(): Promise<void> {
 			await new Promise<void>((r) => setTimeout(r, 300));
 		}
 	}
-	throw `Server failed to start within ${SERVER_START_TIMEOUT_MS}ms. Check ${cfg.server_log_file}`;
+	throw new Error(`Server failed to start within ${SERVER_START_TIMEOUT_MS}ms. Check ${cfg.server_log_file}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -192,7 +207,17 @@ async function waitForKernelFile(path: string, timeoutMs = 5000): Promise<void> 
 // Server communication
 // ---------------------------------------------------------------------------
 
-async function serverPost(endpoint: string, body: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
+interface HttpOpts {
+	signal?: AbortSignal;
+	timeoutS?: number;
+}
+
+function httpSignal(timeoutS: number | undefined, signal?: AbortSignal): AbortSignal {
+	const ms = timeoutS !== undefined ? (timeoutS + TIMEOUT_MARGIN_S) * 1000 : CONTROL_TIMEOUT_MS;
+	return signal ? AbortSignal.any([signal, AbortSignal.timeout(ms)]) : AbortSignal.timeout(ms);
+}
+
+async function serverPost(endpoint: string, body: Record<string, unknown> = {}, opts: HttpOpts = {}): Promise<Record<string, unknown>> {
 	await ensureServerRunning();
 
 	const url = `${SERVER}${endpoint}`;
@@ -203,41 +228,39 @@ async function serverPost(endpoint: string, body: Record<string, unknown> = {}):
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify(body),
-			signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+			signal: httpSignal(opts.timeoutS, opts.signal),
 		});
 	} catch (err) {
-		const msg = err instanceof Error ? err.message : String(err);
-		throw `Cannot reach kernel server at ${SERVER}.\n${msg}`;
+		throw new Error(`Cannot reach kernel server at ${SERVER}.\n${errMsg(err)}`);
 	}
 
 	const data = (await res.json()) as Record<string, unknown>;
 
 	if (!res.ok) {
 		const detail = typeof data.detail === "string" ? data.detail : `HTTP ${res.status}`;
-		throw `Server error: ${detail}`;
+		throw new Error(`Server error: ${detail}`);
 	}
 
 	return data;
 }
 
-async function serverGet(endpoint: string): Promise<Record<string, unknown>> {
+async function serverGet(endpoint: string, opts: HttpOpts = {}): Promise<Record<string, unknown>> {
 	await ensureServerRunning();
 
 	const url = `${SERVER}${endpoint}`;
 	let res: Response;
 
 	try {
-		res = await fetch(url, { signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
+		res = await fetch(url, { signal: httpSignal(opts.timeoutS, opts.signal) });
 	} catch (err) {
-		const msg = err instanceof Error ? err.message : String(err);
-		throw `Cannot reach kernel server at ${SERVER}.\n${msg}`;
+		throw new Error(`Cannot reach kernel server at ${SERVER}.\n${errMsg(err)}`);
 	}
 
 	const data = (await res.json()) as Record<string, unknown>;
 
 	if (!res.ok) {
 		const detail = typeof data.detail === "string" ? data.detail : `HTTP ${res.status}`;
-		throw `Server error: ${detail}`;
+		throw new Error(`Server error: ${detail}`);
 	}
 
 	return data;
@@ -251,7 +274,7 @@ export default function (pi: ExtensionAPI) {
 	// -----------------------------------------------------------------------
 	// 1. kernel_start
 	// -----------------------------------------------------------------------
-	pi.registerTool({
+	const kernelStartTool = defineTool({
 		name: "kernel_start",
 		label: "Kernel Start",
 		description:
@@ -311,6 +334,10 @@ export default function (pi: ExtensionAPI) {
 
 				const pid = kernelProcess.pid as number;
 
+				// Capture the process start time so kernel_stop can later verify
+				// identity before signaling (never signal a recycled PID).
+				kernelStartedAt = await procStartTime(pid);
+
 				// Wait for kernel file to be created
 				await waitForKernelFile(kernelFile);
 
@@ -339,11 +366,7 @@ export default function (pi: ExtensionAPI) {
 					details: { pid, kernel_file: kernelFile },
 				};
 			} catch (err) {
-				return {
-					content: [{ type: "text", text: `❌ ${err}` }],
-					details: {},
-					isError: true,
-				};
+				throw new Error(`❌ ${errMsg(err)}`);
 			}
 		},
 	});
@@ -351,7 +374,7 @@ export default function (pi: ExtensionAPI) {
 	// -----------------------------------------------------------------------
 	// 2. kernel_connect
 	// -----------------------------------------------------------------------
-	pi.registerTool({
+	const kernelConnectTool = defineTool({
 		name: "kernel_connect",
 		label: "Kernel Connect",
 		description:
@@ -370,23 +393,20 @@ export default function (pi: ExtensionAPI) {
 				Type.Boolean({ description: "Use this connection file for subsequent calls (default: true)" }),
 			),
 		}),
-		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+		async execute(_toolCallId, params, signal, _onUpdate, _ctx) {
 			try {
 				const cfg = loadConfig();
-				const connectionFile = params.path ?? cfg.kernel_connection_file;
+				// Some models include a leading @ in path arguments — strip it.
+				const connectionFile = (params.path?.replace(/^@/, "") ?? cfg.kernel_connection_file) || "";
 
 				if (!connectionFile) {
-					return {
-						content: [{ type: "text", text: "❌ No kernel connection file specified. Provide path argument or configure kernel_connection_file in cfg.json." }],
-						details: {},
-						isError: true,
-					};
+					throw new Error("❌ No kernel connection file specified. Provide path argument or configure kernel_connection_file in cfg.json.");
 				}
 
 				const data = await serverPost("/kernel/connect", {
 					connection_file: connectionFile,
 					set_default: params.set_default ?? true,
-				});
+				}, { signal });
 
 				// Update config if path was provided
 				if (params.path && params.set_default !== false) {
@@ -399,11 +419,7 @@ export default function (pi: ExtensionAPI) {
 					details: data,
 				};
 			} catch (err) {
-				return {
-					content: [{ type: "text", text: `❌ ${err}` }],
-					details: {},
-					isError: true,
-				};
+				throw new Error(`❌ ${errMsg(err)}`);
 			}
 		},
 	});
@@ -411,7 +427,7 @@ export default function (pi: ExtensionAPI) {
 	// -----------------------------------------------------------------------
 	// 3. kernel_run_python
 	// -----------------------------------------------------------------------
-	pi.registerTool({
+	const kernelRunPythonTool = defineTool({
 		name: "kernel_run_python",
 		label: "Kernel Run Python",
 		description:
@@ -423,18 +439,20 @@ export default function (pi: ExtensionAPI) {
 			"Use kernel_run_python to execute Python code when you need the kernel state (variables, imports) to persist across calls.",
 			"Output is truncated — use kernel_get_output to retrieve the full output if needed.",
 		],
+		executionMode: "sequential",
 		parameters: Type.Object({
 			code: Type.String({ description: "Python code to execute" }),
 			timeout_s: Type.Optional(
-				Type.Number({ description: "Timeout in seconds (default: 30)" }),
+				Type.Number({ description: "Timeout in seconds (default: 60)" }),
 			),
 		}),
-		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+		async execute(_toolCallId, params, signal, onUpdate, _ctx) {
 			try {
+				onUpdate?.({ content: [{ type: "text", text: "⏳ Executing in kernel…" }], details: undefined });
 				const data = await serverPost("/kernel/run-code", {
 					code: params.code,
 					timeout_s: params.timeout_s,
-				});
+				}, { signal, timeoutS: params.timeout_s });
 				const truncated = data.truncated;
 				let text = data.output as string;
 				if (truncated) {
@@ -445,11 +463,7 @@ export default function (pi: ExtensionAPI) {
 					details: data,
 				};
 			} catch (err) {
-				return {
-					content: [{ type: "text", text: `❌ ${err}` }],
-					details: {},
-					isError: true,
-				};
+				throw new Error(`❌ ${errMsg(err)}`);
 			}
 		},
 	});
@@ -457,7 +471,7 @@ export default function (pi: ExtensionAPI) {
 	// -----------------------------------------------------------------------
 	// 4. kernel_eval_expr
 	// -----------------------------------------------------------------------
-	pi.registerTool({
+	const kernelEvalExprTool = defineTool({
 		name: "kernel_eval_expr",
 		label: "Kernel Eval Expression",
 		description:
@@ -468,28 +482,25 @@ export default function (pi: ExtensionAPI) {
 		promptGuidelines: [
 			"Use kernel_eval_expr for lightweight expression evaluation (checking variable values, types, quick math) instead of kernel_run_python.",
 		],
+		executionMode: "sequential",
 		parameters: Type.Object({
 			expr: Type.String({ description: "Python expression to evaluate (e.g., 'len(data)', '2 + 2')" }),
 			timeout_s: Type.Optional(
-				Type.Number({ description: "Timeout in seconds (default: 30)" }),
+				Type.Number({ description: "Timeout in seconds (default: 60)" }),
 			),
 		}),
-		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+		async execute(_toolCallId, params, signal, _onUpdate, _ctx) {
 			try {
 				const data = await serverPost("/kernel/eval-expr", {
 					expr: params.expr,
 					timeout_s: params.timeout_s,
-				});
+				}, { signal, timeoutS: params.timeout_s });
 				return {
 					content: [{ type: "text", text: data.result as string }],
 					details: data,
 				};
 			} catch (err) {
-				return {
-					content: [{ type: "text", text: `❌ ${err}` }],
-					details: {},
-					isError: true,
-				};
+				throw new Error(`❌ ${errMsg(err)}`);
 			}
 		},
 	});
@@ -497,7 +508,7 @@ export default function (pi: ExtensionAPI) {
 	// -----------------------------------------------------------------------
 	// 5. kernel_interrupt
 	// -----------------------------------------------------------------------
-	pi.registerTool({
+	const kernelInterruptTool = defineTool({
 		name: "kernel_interrupt",
 		label: "Kernel Interrupt",
 		description:
@@ -507,20 +518,17 @@ export default function (pi: ExtensionAPI) {
 		promptGuidelines: [
 			"Use kernel_interrupt if a kernel_run_python call appears to be stuck or is taking too long.",
 		],
+		executionMode: "sequential",
 		parameters: Type.Object({}),
-		async execute(_toolCallId, _params, _signal, _onUpdate, _ctx) {
+		async execute(_toolCallId, _params, signal, _onUpdate, _ctx) {
 			try {
-				await serverPost("/kernel/interrupt");
+				await serverPost("/kernel/interrupt", {}, { signal });
 				return {
 					content: [{ type: "text", text: "🛑 Kernel interrupted" }],
 					details: {},
 				};
 			} catch (err) {
-				return {
-					content: [{ type: "text", text: `❌ ${err}` }],
-					details: {},
-					isError: true,
-				};
+				throw new Error(`❌ ${errMsg(err)}`);
 			}
 		},
 	});
@@ -528,7 +536,7 @@ export default function (pi: ExtensionAPI) {
 	// -----------------------------------------------------------------------
 	// 6. kernel_get_output
 	// -----------------------------------------------------------------------
-	pi.registerTool({
+	const kernelGetOutputTool = defineTool({
 		name: "kernel_get_output",
 		label: "Kernel Get Output",
 		description:
@@ -538,6 +546,7 @@ export default function (pi: ExtensionAPI) {
 		promptGuidelines: [
 			"Use kernel_get_output when kernel_run_python output was truncated — retrieve the full output in slices.",
 		],
+		executionMode: "sequential",
 		parameters: Type.Object({
 			start: Type.Optional(
 				Type.Number({ description: "Character offset to start from (default: 0)" }),
@@ -546,12 +555,12 @@ export default function (pi: ExtensionAPI) {
 				Type.Number({ description: "Maximum characters to return (default: 4000)" }),
 			),
 		}),
-		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+		async execute(_toolCallId, params, signal, _onUpdate, _ctx) {
 			try {
 				const data = await serverPost("/kernel/get-output", {
 					start: params.start ?? 0,
 					limit: params.limit ?? 4000,
-				});
+				}, { signal });
 				const { output, start, end, total } = data as {
 					output: string;
 					start: number;
@@ -564,11 +573,7 @@ export default function (pi: ExtensionAPI) {
 					details: data,
 				};
 			} catch (err) {
-				return {
-					content: [{ type: "text", text: `❌ ${err}` }],
-					details: {},
-					isError: true,
-				};
+				throw new Error(`❌ ${errMsg(err)}`);
 			}
 		},
 	});
@@ -576,7 +581,7 @@ export default function (pi: ExtensionAPI) {
 	// -----------------------------------------------------------------------
 	// 7. kernel_stop
 	// -----------------------------------------------------------------------
-	pi.registerTool({
+	const kernelStopTool = defineTool({
 		name: "kernel_stop",
 		label: "Kernel Stop",
 		description:
@@ -587,8 +592,9 @@ export default function (pi: ExtensionAPI) {
 			"Use kernel_stop only to stop a kernel that was started by kernel_start.",
 			"Does nothing if the kernel was not created by Pi.",
 		],
+		executionMode: "sequential",
 		parameters: Type.Object({}),
-		async execute(_toolCallId, _params, _signal, _onUpdate, _ctx) {
+		async execute(_toolCallId, _params, signal, _onUpdate, _ctx) {
 			try {
 				const cfg = loadConfig();
 
@@ -600,11 +606,7 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				if (!cfg.kernel_pid) {
-					return {
-						content: [{ type: "text", text: "⚠️ kernel_auto_created is true but kernel_pid is null." }],
-						details: {},
-						isError: true,
-					};
+					throw new Error("⚠️ kernel_auto_created is true but kernel_pid is null.");
 				}
 
 				const savedPid = cfg.kernel_pid;
@@ -613,7 +615,7 @@ export default function (pi: ExtensionAPI) {
 
 				// 1. Try graceful shutdown via the kernel's control channel
 				try {
-					await serverPost("/kernel/shutdown");
+					await serverPost("/kernel/shutdown", {}, { signal });
 					shutdownMethod = "graceful shutdown";
 					// Give the kernel a moment to exit cleanly
 					await new Promise<void>((r) => setTimeout(r, 500));
@@ -627,13 +629,19 @@ export default function (pi: ExtensionAPI) {
 					kernelProcess = null;
 				}
 
-				// 3. Kill the process group to catch any child Python process
-				try {
-					process.kill(-savedPid);
-				} catch {
-					// Process group may not exist — try individual PID
-					try { process.kill(savedPid); } catch { /* already dead */ }
+				// 3. Fallback: signal the saved PID only if it is still alive AND
+				//    its start time matches what we captured at spawn — never a
+				//    recycled PID.
+				const isAlive = (pid: number): boolean => {
+					try { process.kill(pid, 0); return true; } catch { return false; }
+				};
+				if (isAlive(savedPid)) {
+					const nowStart = await procStartTime(savedPid);
+					if (kernelStartedAt && nowStart && nowStart === kernelStartedAt) {
+						try { process.kill(savedPid, "SIGKILL"); } catch { /* already dead */ }
+					}
 				}
+				kernelStartedAt = null;
 
 				// 4. Clean up the kernel connection file
 				if (kernelFile) {
@@ -658,11 +666,7 @@ export default function (pi: ExtensionAPI) {
 					details: { pid: savedPid, method: shutdownMethod },
 				};
 			} catch (err) {
-				return {
-					content: [{ type: "text", text: `❌ ${err}` }],
-					details: {},
-					isError: true,
-				};
+				throw new Error(`❌ ${errMsg(err)}`);
 			}
 		},
 	});
@@ -670,7 +674,7 @@ export default function (pi: ExtensionAPI) {
 	// -----------------------------------------------------------------------
 	// 8. kernel_status
 	// -----------------------------------------------------------------------
-	pi.registerTool({
+	const kernelStatusTool = defineTool({
 		name: "kernel_status",
 		label: "Kernel Status",
 		description:
@@ -717,12 +721,17 @@ export default function (pi: ExtensionAPI) {
 					details: { serverRunning, kernelConnected, ...cfg },
 				};
 			} catch (err) {
-				return {
-					content: [{ type: "text", text: `❌ ${err}` }],
-					details: {},
-					isError: true,
-				};
+				throw new Error(`❌ ${errMsg(err)}`);
 			}
 		},
 	});
+
+	pi.registerTool(kernelStartTool);
+	pi.registerTool(kernelConnectTool);
+	pi.registerTool(kernelRunPythonTool);
+	pi.registerTool(kernelEvalExprTool);
+	pi.registerTool(kernelInterruptTool);
+	pi.registerTool(kernelGetOutputTool);
+	pi.registerTool(kernelStopTool);
+	pi.registerTool(kernelStatusTool);
 }

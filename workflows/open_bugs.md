@@ -135,6 +135,32 @@ regardless of cwd.
 
 ---
 
+## BUG-09: Fresh `BlockingKernelClient` per request leaks ZMQ sockets
+
+**Severity:** High (blocks long-lived per-kernel bridge in step 17)
+**File:** `server/main.py` (`_connect` + every endpoint's `finally: client.stop_channels()`)
+**Status:** Open — fix in Phase B
+
+Every endpoint calls `_connect()` which creates a **new** `BlockingKernelClient`
+(`start_channels()` → 5 channel threads each with a ZMQ socket), and cleans up
+with `client.stop_channels()`. `stop_channels()` stops the channel **threads**
+but does **not** close their sockets (`close()` is never called, and the shared
+`zmq.Context.instance()` is not destroyed because `_created_context` is False).
+
+Result: each request leaks ~5 ZMQ sockets. Under sustained use (≈7+ rapid
+requests, observed empirically) channel threads fail with
+`zmq.error.ZMQError: Too many open files`. The current server survives only
+because it is short-lived and traffic is bursty.
+
+**Fix (Phase B):** the per-kernel bridge owns **one** `BlockingKernelClient`
+created at startup and reused across all requests (close it on bridge
+`/shutdown`). This is the natural per-kernel-bridge design — the bridge knows
+its kernel's connection file at spawn — and it eliminates the create/stop cycle
+entirely. If a fresh-client pattern is ever needed, call `client.close()`
+(channel sockets) in the `finally`, not just `stop_channels()`.
+
+---
+
 ## Resolved (for reference)
 
 | Bug | Resolution | Commit |

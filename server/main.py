@@ -14,8 +14,10 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import sys
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
@@ -38,7 +40,7 @@ class ServerConfig:
     port: int = 9123
     kernel_connection_file: str = ""
     max_output_chars: int = 20000
-    default_timeout_s: float = 30.0
+    default_timeout_s: float = 60.0
     kernel_channel_timeout_s: float = 5.0
 
 
@@ -54,7 +56,7 @@ def load_config(cwd: str | None = None) -> ServerConfig:
         port=int(raw.get("port", 9123)),
         kernel_connection_file=str(raw.get("kernel_connection_file", "")),
         max_output_chars=int(raw.get("max_output_chars", 20000)),
-        default_timeout_s=float(raw.get("default_timeout_s", 30.0)),
+        default_timeout_s=float(raw.get("default_timeout_s", 60.0)),
         kernel_channel_timeout_s=float(raw.get("kernel_channel_timeout_s", 5.0)),
     )
 
@@ -92,10 +94,10 @@ def _connect(path: str) -> BlockingKernelClient:
     return c
 
 
-def _truncate(text: str, max_chars: int) -> str:
+def _truncate(text: str, max_chars: int) -> tuple[str, bool]:
     if max_chars > 0 and len(text) > max_chars:
-        return text[:max_chars] + "\n…(truncated)…"
-    return text
+        return text[:max_chars] + "\n…(truncated)…", True
+    return text, False
 
 
 # ---------------------------------------------------------------------------
@@ -219,7 +221,7 @@ async def kernel_run_code(req: RunCodeRequest):
 
     try:
         client = _connect(path)
-    except (FileNotFoundError, RuntimeError, Exception) as e:
+    except Exception as e:
         raise HTTPException(502, detail=str(e))
 
     try:
@@ -227,8 +229,15 @@ async def kernel_run_code(req: RunCodeRequest):
         msg_id = client.execute(req.code, silent=False, store_history=True, allow_stdin=True)
 
         out: list[str] = []
+        deadline = time.monotonic() + timeout
         while True:
-            msg = client.get_iopub_msg(timeout=timeout)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Execution timed out")
+            try:
+                msg = client.get_iopub_msg(timeout=min(remaining, 1.0))
+            except queue.Empty:
+                continue  # no message yet; keep waiting until the overall deadline
             if msg.get("parent_header", {}).get("msg_id") != msg_id:
                 continue
 
@@ -256,8 +265,8 @@ async def kernel_run_code(req: RunCodeRequest):
         with _last_output_lock:
             _last_output_full = full
 
-        truncated = _truncate(full, config.max_output_chars)
-        return RunCodeResponse(output=truncated, truncated=len(truncated) < len(full))
+        truncated, was_truncated = _truncate(full, config.max_output_chars)
+        return RunCodeResponse(output=truncated, truncated=was_truncated)
     except Exception as e:
         raise HTTPException(504, detail=f"Execution failed or timed out: {e}")
     finally:
@@ -276,7 +285,7 @@ async def kernel_eval_expr(req: EvalExprRequest):
 
     try:
         client = _connect(path)
-    except (FileNotFoundError, RuntimeError, Exception) as e:
+    except Exception as e:
         raise HTTPException(502, detail=str(e))
 
     try:
@@ -329,7 +338,7 @@ async def kernel_interrupt():
 
     try:
         client = _connect(path)
-    except (FileNotFoundError, RuntimeError, Exception) as e:
+    except Exception as e:
         raise HTTPException(502, detail=str(e))
 
     try:
@@ -355,7 +364,7 @@ async def kernel_shutdown():
 
     try:
         client = _connect(path)
-    except (FileNotFoundError, RuntimeError, Exception) as e:
+    except Exception as e:
         raise HTTPException(502, detail=str(e))
 
     try:

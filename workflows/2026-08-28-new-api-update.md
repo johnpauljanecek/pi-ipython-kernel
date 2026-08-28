@@ -602,6 +602,10 @@ No `~/.ipy/sessions/` dir — sessions hold only an in-memory "connected kernel 
 
 - CLI: `python server/main.py --kernel-file <path> --port <port> [--token <tok>]`. The bridge
   loads that one kernel's connection file at startup; all endpoints use it (no global default).
+- **One `BlockingKernelClient` per bridge** (BUG-09): create it once at startup and reuse it
+  across requests; close it on bridge `/shutdown`. Do NOT create a fresh client per request —
+  `stop_channels()` stops threads but leaks ZMQ sockets (`close()` is never called), which
+  exhausts sockets under sustained use.
 - Self-provisioning (no `.venv` needed for a distributed install — critique #3):
   `uv run --with fastapi --with jupyter_client --with pyzmq python server/main.py --kernel-file … --port …`
 - Output cache (`_last_output_full`) is per-bridge = per-kernel.
