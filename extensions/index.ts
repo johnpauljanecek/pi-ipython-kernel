@@ -958,7 +958,15 @@ export default function (pi: ExtensionAPI) {
 				const data = await kernelGet(name, "/kernel/python", { signal });
 				const executable = data.executable as string;
 				const jupyterBin = data.jupyter_bin as string | null;
+				const hasConsole = data.has_jupyter_console as boolean;
 				const kernelFile = meta.kernel_file;
+
+				if (!jupyterBin && !hasConsole) {
+					throw new Error(
+						`Kernel '${name}' env (${executable}) has no jupyter-console. ` +
+						`Install it (uv pip install --python ${executable} jupyter-console) or start the kernel with an env that has it.`,
+					);
+				}
 				const cmd = jupyterBin
 					? `"${jupyterBin}" console --existing "${kernelFile}"`
 					: `"${executable}" -m jupyter console --existing "${kernelFile}"`;

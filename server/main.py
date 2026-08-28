@@ -241,7 +241,8 @@ def _get_kernel_python_blocking() -> dict[str, Any]:
         raise RuntimeError("Bridge has no kernel client")
     with _shell_lock:
         msg_id = client.execute(
-            "import sys; print(sys.executable)",
+            "import sys, importlib.util; print(sys.executable); "
+            "print('has_jupyter_console', importlib.util.find_spec('jupyter_console') is not None)",
             silent=False,
             store_history=False,
             allow_stdin=False,
@@ -266,14 +267,19 @@ def _get_kernel_python_blocking() -> dict[str, Any]:
                 raise RuntimeError("\n".join(content.get("traceback", []) or []) or "error")
             elif mt == "status" and content.get("execution_state") == "idle":
                 break
-        text = "".join(out).strip()
-        if not text:
+        lines = [ln.strip() for ln in "".join(out).splitlines() if ln.strip()]
+        if not lines:
             raise RuntimeError("Could not determine kernel python executable")
-        executable = text.splitlines()[-1]
+        executable = lines[0]
+        has_jupyter_console = any(
+            ln.startswith("has_jupyter_console") and ln.endswith("True") for ln in lines
+        )
         jupyter_bin = str(Path(executable).parent / "jupyter")
+        jupyter_ok = has_jupyter_console and Path(jupyter_bin).exists()
         return {
             "executable": executable,
-            "jupyter_bin": jupyter_bin if Path(jupyter_bin).exists() else None,
+            "jupyter_bin": jupyter_bin if jupyter_ok else None,
+            "has_jupyter_console": has_jupyter_console,
         }
 
 

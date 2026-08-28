@@ -215,6 +215,12 @@ def test_kernel_python_returns_kernel_env(session):
     assert status == 200
     assert data["executable"] and Path(data["executable"]).is_file()
     assert data["executable"] != sys.executable  # kernel env ≠ pytest/bridge env
+    assert isinstance(data["has_jupyter_console"], bool)
+    # jupyter_bin is non-null only when jupyter-console is importable in the kernel
+    if data["has_jupyter_console"]:
+        assert data["jupyter_bin"] and Path(data["jupyter_bin"]).exists()
+    else:
+        assert data["jupyter_bin"] is None
     # endpoint is token-protected like the rest
     status_noauth, _ = http("GET", url(session, "/kernel/python"))
     assert status_noauth == 401
