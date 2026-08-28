@@ -25,7 +25,7 @@
 import { defineTool, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { execa } from "execa";
-import { readFileSync, existsSync, mkdirSync } from "fs";
+import { readFileSync, existsSync, mkdirSync, writeFileSync, chmodSync } from "fs";
 import { resolve, join, basename } from "path";
 import { homedir } from "os";
 import { randomBytes } from "crypto";
@@ -938,8 +938,9 @@ export default function (pi: ExtensionAPI) {
 		name: "kernel_console_cmd",
 		label: "Kernel Console Command",
 		description:
-			"Show the one-line command to attach a Jupyter console to a kernel (copy-paste ready), " +
-			"using the kernel's own Python environment. Use kernel_connect first, or pass a name.",
+			"Show a copy-paste command to attach a Jupyter console to a kernel, using the kernel's own " +
+			"Python environment. Writes console.sh next to the kernel; paste `bash ~/.ipy/kernels/<name>/console.sh` " +
+			"(short line, never wrapped). Use kernel_connect first, or pass a name.",
 		promptSnippet: "Show the jupyter console command for a kernel",
 		promptGuidelines: [
 			"Use kernel_console_cmd to get a copy-paste command that opens a Jupyter console attached to a running kernel.",
@@ -961,9 +962,18 @@ export default function (pi: ExtensionAPI) {
 				const cmd = jupyterBin
 					? `"${jupyterBin}" console --existing "${kernelFile}"`
 					: `"${executable}" -m jupyter console --existing "${kernelFile}"`;
+
+				// Persist the command as a script so the copy-paste line stays short —
+				// long one-liners get wrapped by the TUI/terminal when copied.
+				const scriptPath = join(kernelDir(name), "console.sh");
+				writeFileSync(scriptPath, `#!/bin/sh\nexec ${cmd}\n`, "utf-8");
+				try { chmodSync(scriptPath, 0o755); } catch { /* best effort */ }
+
 				return {
-					content: [{ type: "text", text: cmd }],
-					details: { command: cmd, kernel: name, executable, jupyter_bin: jupyterBin, kernel_file: kernelFile },
+					content: [
+						{ type: "text", text: `bash ${scriptPath}\n\nfull command: ${cmd}` },
+					],
+					details: { command: cmd, script: scriptPath, kernel: name, executable, jupyter_bin: jupyterBin, kernel_file: kernelFile },
 				};
 			} catch (err) {
 				throw new Error(`❌ ${errMsg(err)}`);

@@ -117,7 +117,15 @@ kernel_stop { "name": "data" }
 kernel_console_cmd
 ```
 
-Returns a single copy-paste line (e.g. `"/path/to/kernel-env/bin/jupyter" console --existing "/Users/.../.ipy/kernels/<name>/kernel.json"`) that opens a Jupyter console attached to the running kernel, using the kernel's own Python environment.
+Writes `~/.ipy/kernels/<name>/console.sh` and returns a short, copy-safe line
+to paste (long one-liners get wrapped when copied):
+
+```bash
+bash ~/.ipy/kernels/<name>/console.sh
+```
+
+The script runs the kernel's own `jupyter console --existing <kernel.json>`
+(the kernel's Python environment, not a hardcoded one).
 
 ## Registry
 
