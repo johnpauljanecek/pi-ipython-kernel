@@ -61,10 +61,10 @@ test("buildKernelCommand: version spec (uv run --isolated --python <spec> --with
 	]);
 });
 
-test("buildKernelCommand: interpreter/venv path (uv run --isolated --python <path> --with ipykernel)", () => {
+test("buildKernelCommand: interpreter/venv path (uv run --no-project --python <path> --with ipykernel)", () => {
 	const cmd = buildKernelCommand("/opt/venv/bin/python", "/k/kernel.json");
 	assert.deepEqual(cmd, [
-		"run", "--isolated", "--python", "/opt/venv/bin/python", "--with", "ipykernel", "python", "-m", "ipykernel", "-f", "/k/kernel.json",
+		"run", "--no-project", "--python", "/opt/venv/bin/python", "--with", "ipykernel", "python", "-m", "ipykernel", "-f", "/k/kernel.json",
 	]);
 });
 

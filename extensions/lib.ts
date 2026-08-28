@@ -167,6 +167,14 @@ export function buildKernelCommand(python: string, kernelFile: string): string[]
 	if (python === "project") {
 		return ["run", "--with", "ipykernel", "python", "-m", "ipykernel", "-f", kernelFile];
 	}
-	// Version spec (e.g. "3.11") or absolute interpreter/venv path
+	if (python.includes("/")) {
+		// Interpreter/venv path: use the venv's own packages (playwright etc.)
+		// with ipykernel overlaid via --with. Do NOT use --isolated (it builds a
+		// fresh env ignoring the venv's site-packages), and do NOT use a bare
+		// `uv run --python` inside a project dir (uv would silently switch to the
+		// project env) — hence --no-project.
+		return ["run", "--no-project", "--python", python, "--with", "ipykernel", "python", "-m", "ipykernel", "-f", kernelFile];
+	}
+	// Version spec (e.g. "3.11"): no existing env — fresh --isolated env + ipykernel
 	return ["run", "--isolated", "--python", python, "--with", "ipykernel", "python", "-m", "ipykernel", "-f", kernelFile];
 }

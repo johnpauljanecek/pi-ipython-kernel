@@ -365,7 +365,7 @@ export default function (pi: ExtensionAPI) {
 					throw new Error(`Invalid kernel name '${name}' — use letters, digits, '_', '-', or '.'`);
 				}
 				const workingDir = expandUser(params.cwd ?? cfg.default_cwd);
-				const python = params.python ?? cfg.python;
+				const python = expandUser(params.python ?? cfg.python);
 
 				// Name collision (decision 5): attach if live, replace if dead.
 				const existing = readMeta(name);
