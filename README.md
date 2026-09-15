@@ -2,6 +2,38 @@
 
 Pi extension for controlling IPython kernels via HTTP. Each kernel is a **persistent named resource** with its own companion FastAPI bridge (one per kernel) that wraps `jupyter_client.BlockingKernelClient`. Kernels live in `~/.ipy/kernels/<name>/` and outlive pi sessions.
 
+## Why
+
+Coding agents execute Python through one-shot shell calls: every tool call is a
+fresh process. Variables vanish, imports re-run, a 500 MB DataFrame is read
+from disk again on the next step, and any iterative work gets squeezed into
+monolithic scripts. Notebooks fix the state problem — but they are built for
+humans clicking cells, not for an agent, and getting an LLM to reliably edit a
+worksheet is a losing battle.
+
+ipyforge-kernel keeps the part of Jupyter that matters — **the live kernel** —
+and drops the notebook UI. The result:
+
+- **State persists across LLM calls.** Load data once, define helpers once,
+  keep an authenticated API session open — every subsequent tool call is fast
+  because nothing is reloaded.
+- **It survives the session.** Kernels are detached processes: quit pi, close
+  the terminal, come back tomorrow — connect by name and your objects are
+  still there.
+- **It doubles as a state machine.** Because every turn reads and mutates the
+  same live namespace, multi-step workflows (staged pipelines, session-scoped
+  caches, accumulators) become natural — something a stateless bash tool
+  cannot express.
+- **You can sit next to the agent.** `kernel_console_cmd` attaches a real
+  Jupyter console to the *same* kernel: you and the agent share one namespace
+  for pair debugging.
+- **Parallel contexts by name.** Run `data`, `om`, and `experiments` kernels
+  side by side, each with its own interpreter (uv-resolved), cwd, and state.
+
+Typical uses: exploratory data analysis, API prototyping and
+reverse-engineering, long computations you can poll and interrupt, and any
+workflow where re-running setup on every step is the bottleneck.
+
 ## Installation
 
 ### From npm (once published)
