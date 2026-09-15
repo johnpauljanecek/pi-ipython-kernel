@@ -101,9 +101,25 @@ User preferences live in `cfg.json` in the package root (see `cfg.json.example`)
 
 ## Requirements
 
-- `uv` installed and available in PATH.
-- The bridge self-provisions its dependencies (`uv run --with fastapi --with uvicorn --with jupyter_client --with pyzmq --with pydantic`); no `.venv` required.
-- Kernels run via uv (`uv tool run --from ipython --with ipykernel …` for the default interpreter).
+As of now:
+
+- **pi** (the coding agent) — the host application that loads this extension. Verified compatible through pi 0.85.1.
+- **`uv`** available in `PATH` — the only hard dependency. Nothing else is installed by hand:
+  - Default interpreter: `uv tool run --from ipython --with ipykernel python -m ipykernel …` (uv fetches IPython + ipykernel into its tool env on first start).
+  - `"python": "project"`: `uv run --with ipykernel …` inside the project's env.
+  - Version spec or venv path (e.g. `"3.11"`, a `.venv` path): `uv run --no-project --python <spec> --with ipykernel …`.
+  - The bridge self-provisions (`uv run --with fastapi --with uvicorn --with jupyter_client --with pyzmq --with pydantic …`); no `.venv` required.
+- A POSIX-style OS. **Windows is not supported and there are no plans to port it** — the author has no Windows machine. Blockers: `detached` process-group semantics, `SIGKILL`-based stop paths, and the PID start-time guard are all POSIX-specific (the bridge, jupyter_client, and ipykernel themselves are Windows-capable, so a port would be a moderate effort limited to process management).
+- Writable `~/.ipy/kernels/` (the registry) and loopback networking (the bridge binds `127.0.0.1` on a free port).
+- Optional: `jupyter-console` in the kernel's environment, only for `kernel_console_cmd` interactive handoff.
+- Optional: a `cfg.json` in the package root (see `cfg.json.example`); without one, sane defaults apply.
+
+Note: the first `kernel_start` on a fresh machine is slower while uv downloads IPython/ipykernel/FastAPI into its cache; subsequent starts are near-instant.
+
+Dev-only requirements (not needed to run the extension):
+
+- Node ≥ 22.6 for `npm test` (native TS); TypeScript for `npm run typecheck`.
+- `uv sync --group dev` once, for `npm run test:bridge` (pytest).
 
 ## Testing
 
