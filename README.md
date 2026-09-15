@@ -62,6 +62,59 @@ kernel_stop { "name": "data" }
 - Each kernel has a **companion bridge** (its own free port, its own output cache) that lives and dies with it. Two pi sessions can attach to the same kernel by name.
 - **tmux is not required for kernel persistence.** It is only useful for keeping *pi itself* running across ssh disconnects / terminal closes.
 
+## Architecture
+
+```
+pi (extension tools)                    kernel registry (per user)
+  kernel_start ─┐                         ~/.ipy/kernels/<name>/
+                │ spawn (execa, detached)   ├── kernel.json   # ipykernel connection file
+                ▼                           ├── meta.json     # pids, bridge port, python, cwd, token…
+  ipykernel process ◄──ZMQ channels──┐      ├── kernel.log
+  (your Python, persistent state)    │      └── bridge.log
+                                     │
+  FastAPI bridge process ◄───────────┘  jupyter_client.BlockingKernelClient
+       ▲  HTTP 127.0.0.1:<free port>
+       │  (X-IPY-TOKEN auth header)
+  pi tool call (run/eval/interrupt/…)
+```
+
+Three moving parts per kernel:
+
+1. **The kernel** — a real `ipykernel` process (IPython underneath). All your
+   state lives here: variables, imports, loaded data, open sessions. Spawned
+   **detached** (own process group) with stdout/stderr teed to `kernel.log`,
+   which is why kernels survive pi quitting, `/quit`, and terminal close.
+
+2. **The bridge** — a small FastAPI process (one per kernel, never shared) that
+   owns a `jupyter_client.BlockingKernelClient` and translates plain HTTP calls
+   into Jupyter ZMQ channels. It provides:
+   - `/run` (execute code, overall-deadline timeout), `/eval` (expression → value),
+     `/interrupt` (ZMQ `interrupt_request`), `/output` (cached output slices),
+     `/health`, `/shutdown`.
+   - An **output cache**: long runs stream updates; `kernel_get_output` slices
+     what was captured without re-executing anything.
+   - **Auth**: a per-kernel random token (generated at start) required as the
+     `X-IPY-TOKEN` header on every request.
+
+3. **The extension** (TypeScript, running inside pi) — registers the 10
+   `kernel_*` tools, resolves interpreters through `uv`, spawns kernel + bridge,
+   and manages the registry at `~/.ipy/kernels/` (`kernel_list` prunes dead
+   entries and reaps orphaned bridges; a PID **start-time guard** prevents
+   signaling a recycled PID).
+
+Why this shape:
+
+- **HTTP, not stdio** — the bridge is language-agnostic plumbing: any pi
+  session (or a plain `curl`) can attach to the same kernel by name; two pi
+  sessions can share one kernel's state.
+- **jupyter_client, not raw ZMQ** — the bridge gets Jupyter's protocol handling
+  (execute replies, stdin, interrupts) for free and stays in sync with the
+  official ipykernel behavior.
+- **Everything through `uv`** — no project installs; interpreters and bridge
+  deps are resolved on demand and cached by uv.
+- **Detached by design** — kernels are resources, not children of a pi session.
+  They die only via `kernel_stop`, a crash, or a reboot.
+
 ## Registry
 
 ```
