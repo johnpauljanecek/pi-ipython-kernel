@@ -45,11 +45,11 @@ npm install execa
 {
   "port": 9123,
   "kernel_connection_file": "/tmp/remote-kernel.json",
-  "default_cwd": "/Users/johnjanecek",
+  "default_cwd": "~",
   "kernel_auto_created": false,
   "kernel_pid": null,
-  "kernel_log_file": "/Users/johnjanecek/.ipy/kernel.log",
-  "server_log_file": "/Users/johnjanecek/.ipy/server.log"
+  "kernel_log_file": "~/.ipy/kernel.log",
+  "server_log_file": "~/.ipy/server.log"
 }
 ```
 
