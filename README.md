@@ -88,9 +88,10 @@ Three moving parts per kernel:
 2. **The bridge** — a small FastAPI process (one per kernel, never shared) that
    owns a `jupyter_client.BlockingKernelClient` and translates plain HTTP calls
    into Jupyter ZMQ channels. It provides:
-   - `/run` (execute code, overall-deadline timeout), `/eval` (expression → value),
-     `/interrupt` (ZMQ `interrupt_request`), `/output` (cached output slices),
-     `/health`, `/shutdown`.
+   - `/kernel/run-code` (execute code, overall-deadline timeout), `/kernel/eval-expr`
+     (expression → value), `/kernel/interrupt` (ZMQ `interrupt_request`),
+     `/kernel/get-output` (cached output slices), `/kernel/status`,
+     `/kernel/python` (report the kernel's interpreter), and `/shutdown`.
    - An **output cache**: long runs stream updates; `kernel_get_output` slices
      what was captured without re-executing anything.
    - **Auth**: a per-kernel random token (generated at start) required as the
