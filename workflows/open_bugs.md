@@ -203,6 +203,68 @@ Make the outcome explicit instead of inferred:
 
 ---
 
+## BUG-11: One bad reply can wedge the whole bridge — no timeout on the shell lock
+
+**Severity:** High (the bridge looks dead; only killing it recovers; the kernel is fine)
+**File:** `server/main.py` (`_eval_expr_blocking`, `_run_code_blocking`, the `_shell_lock` in both)
+**Status:** Open — found 2026-09-16 while driving a live kernel
+
+### Symptom
+
+Every tool call then fails with **"Cannot reach kernel bridge for '<kernel>'. fetch failed"** / "operation
+aborted due to timeout" — for `kernel_eval_expr` *and*, once the lock is held, for `kernel_run_python`. But
+the kernel is perfectly healthy: an independent client answers immediately.
+
+```
+# pi tools:                     ❌ Cannot reach kernel bridge for 'marie'  (repeated)
+# independent console, same kernel:
+$ jupyter console --existing ~/.ipy/kernels/marie/kernel.json --simple-prompt
+  KERNEL-ALIVE https://search.yahoo.com/search?q=myanimelist+fall+2026+anime+lineup   ✅
+```
+
+### Cause (reproduced)
+
+`_eval_expr_blocking` executes with `user_expressions={"__X__": expr}` and waits for the shell reply **with no
+overall bound on how long it will hold `_shell_lock`**. If the reply cannot be serialised normally the request
+never completes, the lock is never released, and every later request queues behind it forever. The trigger in
+this instance was mine:
+
+```
+kernel_eval_expr: __import__("cfx_kernel").status() and "alive"
+                  ^^^ an un-awaited coroutine -- not serialisable as a user_expression
+```
+
+Every subsequent call (including `kernel_run_python`) then timed out, while the kernel itself stayed responsive.
+
+### Fix
+
+1. **Bound the wait** in both `_eval_expr_blocking` and `_run_code_blocking`: an overall deadline on the shell
+   reply, releasing `_shell_lock` on expiry and returning a clear error ("no shell reply in N s — the bridge
+   is still usable"). A lock that can be held forever by one malformed reply is the whole bug.
+2. Detect the dead-end early: if the reply carries `status: error`, or `user_expressions.__X__` is missing or
+   not a dict, return that error instead of falling through.
+3. Cheap hardening: `repr()`/`str()` the user_expression result server-side and refuse to wait on anything the
+   kernel cannot echo back (a coroutine/generator is the common case).
+4. In the bridge's own log, record each `/kernel/run-code` and `/kernel/eval-expr` with its msg_id so a held
+   lock is visible rather than inferred (uvicorn only logged `/health` during the incident, which is what made
+   the diagnosis slow).
+
+### Recovery as it stands today
+
+Kill the per-kernel bridge and let the pi tool respawn it — the **kernel and browser survive** (they are
+separate processes; only the proxy is lost):
+
+```bash
+lsof -tiTCP:<bridge_port> -sTCP:LISTEN | xargs kill      # port from ~/.ipy/kernels/<name>/meta.json or bridge.log
+# then in pi: kernel_connect(name="<kernel>")
+```
+
+`kernel_interrupt` did **not** clear it — the interrupt goes through the same wedged client. In the observed
+case the kernel had also queued the earlier request, so an interrupt *was* worth sending once, but it was the
+bridge restart that actually recovered the session.
+
+---
+
 ## Resolved (for reference)
 
 | Bug | Resolution | Commit |
