@@ -283,6 +283,55 @@ bridge restart that actually recovered the session.
 
 ---
 
+## BUG-12: `kernel_stop` reports success but leaves the ipykernel child running
+
+**Severity:** Medium (a live kernel that the tooling can no longer see, holding its ports)
+**File:** `extensions/index.ts` (`kernel_stop` handler / the stop sequence)
+**Status:** Open — measured 2026-09-16
+
+### Symptom
+
+```
+kernel_stop:  ✅ Kernel 'marie' stopped (PID 18714, graceful shutdown)
+ps:           18730  1  .../python -m ipykernel -f /Users/johnjanecek/.ipy/kernels/marie/kernel.json
+lsof -p 18730: LISTEN on 51516, 51517, 51518, 51520, 51521, 51522   (all five ZMQ ports)
+```
+
+The registry entry is removed, so `kernel_list` no longer shows the kernel — but the **kernel process is still
+alive**, reparented to `PPID 1`, still bound to its ZMQ ports and still holding everything in its namespace
+(a live browser, in this project's case). Nothing short of `kill <child_pid>` clears it.
+
+### Cause
+
+The kernel is started as `uv run --no-project --python <venv> --with ipykernel python -m ipykernel -f
+<kernel.json>`, i.e. **wrapper → child**. The stop path kills the tracked PID (the wrapper) when the graceful
+`shutdown_request` does not complete, and the child is never signalled. Killing the parent of a process that is
+not in the same process group does not take the child with it.
+
+### Why it matters
+
+* **Invisible leak.** The kernel keeps consuming memory and its ports; a later `kernel_start` of the same name
+  allocates *new* ports, so the orphan can live until reboot.
+* **Silent success.** "stopped (PID …, graceful shutdown)" is reported for a stop that did not happen. The
+  user's mental model ("that kernel is gone") becomes false.
+* It is the **same failure class** as the Windows node's `schtasks /end`, which ends the scheduled task's
+  wrapper and leaves the python child holding the node's fixed ports — recorded in AI-Studio
+  `WebScrapping/knowledge/windows-problems.md` §3.3. Two platforms, one mistake: kill the tree, not the handle.
+
+### Fix
+
+1. **Verify after stopping**: after the graceful attempt, check that no process is LISTENING on the kernel's
+   control/shell ports (or that no process matches the connection-file path) and only then report success.
+2. **Escalate to the tree**: `pkill -f "<kernel.json path>"` (or kill the process group if the wrapper is a
+   group leader) before removing the registry entry. Matching the **connection-file path** in the command line
+   is the reliable key — it is unique per kernel and present in the child's argv.
+3. **Report what was actually killed** (PIDs), and warn when a graceful shutdown did not take effect instead of
+   printing a success line.
+4. Cheap detection at startup: on `kernel_start`/`kernel_list`, look for orphaned `ipykernel -f <path>`
+   processes whose registry entry is gone and offer to reap them.
+
+---
+
 ## Resolved (for reference)
 
 | Bug | Resolution | Commit |
