@@ -249,6 +249,24 @@ Every subsequent call (including `kernel_run_python`) then timed out, while the 
    lock is visible rather than inferred (uvicorn only logged `/health` during the incident, which is what made
    the diagnosis slow).
 
+### Second trigger, same defect — a cell that simply runs long (measured 2026-09-16)
+
+The same lock wedges with **no malformed input at all**. A single `run-code` that took longer than the pi tool's
+request timeout (~60 s here — a cell browsing three sites with human-speed pacing) made the client give up while
+the kernel kept executing; the bridge's thread stayed blocked on the shell reply, so every subsequent call failed
+(`Cannot reach kernel bridge … timeout`) for **~4.5 minutes**, until the cell finished.
+
+Practical consequences worth building in:
+
+* the failure surfaces as a **connection error**, which points at the wrong thing — the kernel is healthy;
+* tool callers cannot distinguish "bridge broken" from "a long cell is still running", so they may kill a bridge
+  that was doing nothing wrong (as happened here on the first attempt);
+* hence: bound the shell wait **and** report the distinct state — *"a run is in flight (msg_id …), started Ns ago"*
+  — instead of a bare fetch failure. Same fix as above; this just shows it is not only about bad replies.
+
+Workaround available today: keep cells short (one site per step) or raise `default_timeout_s` in the ipy config
+(default 60) above the longest expected cell.
+
 ### Recovery as it stands today
 
 Kill the per-kernel bridge and let the pi tool respawn it — the **kernel and browser survive** (they are
