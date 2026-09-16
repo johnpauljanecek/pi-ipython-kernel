@@ -1,5 +1,5 @@
 {
-  "name": "@johnjanecek/ipyforge-kernel",
+  "name": "pi-ipython-kernel",
   "version": "0.1.0",
   "keywords": [
     "pi-package"

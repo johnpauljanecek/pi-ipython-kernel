@@ -1,5 +1,5 @@
 """
-ipyforge-kernel-bridge
+pi-ipython-kernel-bridge
 ======================
 FastAPI bridge that wraps jupyter_client.BlockingKernelClient for ONE kernel.
 
@@ -385,7 +385,7 @@ class GetOutputRequest(BaseModel):
 # App
 # ---------------------------------------------------------------------------
 
-app = FastAPI(title="ipyforge-kernel-bridge", version="0.2.0")
+app = FastAPI(title="pi-ipython-kernel-bridge", version="0.1.0")
 
 
 def require_token(
@@ -512,7 +512,7 @@ app.include_router(kernel_router)
 def main() -> None:
     global kernel_file, bridge_port, auth_token, parent_pid, client
 
-    parser = argparse.ArgumentParser(description="ipyforge-kernel-bridge")
+    parser = argparse.ArgumentParser(description="pi-ipython-kernel-bridge")
     parser.add_argument("--kernel-file", required=True, help="Path to kernel.json")
     parser.add_argument("--port", type=int, required=True, help="HTTP port to bind")
     parser.add_argument("--token", default=None, help="Optional auth token")

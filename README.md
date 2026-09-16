@@ -1,4 +1,4 @@
-# ipyforge-kernel
+# pi-ipython-kernel
 
 Pi extension for controlling IPython kernels via HTTP. Each kernel is a **persistent named resource** with its own companion FastAPI bridge (one per kernel) that wraps `jupyter_client.BlockingKernelClient`. Kernels live in `~/.ipy/kernels/<name>/` and outlive pi sessions.
 
@@ -11,7 +11,7 @@ monolithic scripts. Notebooks fix the state problem — but they are built for
 humans clicking cells, not for an agent, and getting an LLM to reliably edit a
 worksheet is a losing battle.
 
-ipyforge-kernel keeps the part of Jupyter that matters — **the live kernel** —
+pi-ipython-kernel keeps the part of Jupyter that matters — **the live kernel** —
 and drops the notebook UI. The result:
 
 - **State persists across LLM calls.** Load data once, define helpers once,
@@ -38,23 +38,23 @@ workflow where re-running setup on every step is the bottleneck.
 
 ### From npm (once published)
 ```bash
-pi install npm:@johnpauljanecek/ipyforge-kernel
+pi install npm:pi-ipython-kernel
 ```
 
 ### From GitHub
 ```bash
-pi install git:github.com/johnpauljanecek/ipyforge-kernel
+pi install git:github.com/johnpauljanecek/pi-ipython-kernel
 ```
 
 ### From local path
 ```bash
-pi install /path/to/ipython_package
+pi install /path/to/pi-ipython-kernel
 ```
 
 ### Try without installing
 ```bash
-pi -e npm:@johnpauljanecek/ipyforge-kernel
-pi -e git:github.com/johnpauljanecek/ipyforge-kernel
+pi -e npm:pi-ipython-kernel
+pi -e git:github.com/johnpauljanecek/pi-ipython-kernel
 ```
 
 ## Tools
@@ -75,7 +75,7 @@ pi -e git:github.com/johnpauljanecek/ipyforge-kernel
 ## Quick Start
 
 ```bash
-pi install /path/to/ipython_package
+pi install /path/to/pi-ipython-kernel
 ```
 
 ```

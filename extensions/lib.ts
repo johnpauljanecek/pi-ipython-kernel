@@ -1,5 +1,5 @@
 /**
- * Pure, testable helpers for the ipyforge-kernel extension.
+ * Pure, testable helpers for the pi-ipython-kernel extension.
  *
  * No pi imports — safe to import directly from Node tests (see tests/).
  * The extension (index.ts) imports from here; this module only depends on

@@ -1,6 +1,6 @@
-# ipyforge-kernel — Pi Extension
+# pi-ipython-kernel — Pi Extension
 
-This extension registers 9 custom tools that manage persistent, named IPython
+This extension registers 10 custom tools that manage persistent, named IPython
 kernels. Each kernel owns a companion FastAPI bridge (one per kernel, never
 shared) wrapping `jupyter_client.BlockingKernelClient`, registered under
 `~/.ipy/kernels/<name>/`.
@@ -10,13 +10,13 @@ shared) wrapping `jupyter_client.BlockingKernelClient`, registered under
 Install as a Pi package:
 
 ```bash
-pi install /path/to/ipython_package
+pi install /path/to/pi-ipython-kernel
 ```
 
 Or from npm (once published):
 
 ```bash
-pi install npm:@johnpauljanecek/ipyforge-kernel
+pi install npm:pi-ipython-kernel
 ```
 
 ## Tools

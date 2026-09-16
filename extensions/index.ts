@@ -1,7 +1,7 @@
 /**
- * @johnjanecek/ipyforge-kernel — Pi extension
+ * pi-ipython-kernel — Pi extension
  *
- * Installed via: pi install /path/to/ipython_package
+ * Installed via: pi install /path/to/pi-ipython-kernel
  *
  * Registers 10 custom tools that manage persistent, named IPython kernels. Each
  * kernel owns a companion FastAPI bridge (one per kernel, never shared) that
