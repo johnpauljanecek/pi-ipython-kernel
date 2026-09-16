@@ -161,6 +161,48 @@ entirely. If a fresh-client pattern is ever needed, call `client.close()`
 
 ---
 
+## BUG-10: An **aborted** cell is reported as success — `"ok"` from `run-code`, `""` from `eval-expr`
+
+**Severity:** Medium (silent data loss: a cell that never ran looks like a clean success)
+**File:** `server/main.py` (`_run_code_blocking` L133–172, `_eval_expr_blocking` L176–214)
+**Status:** Open
+
+### What happens
+
+The two execution paths each read **one** channel and never look at the execution outcome:
+
+| Function | Reads | Ignores | Renders an aborted reply as |
+|---|---|---|---|
+| `_run_code_blocking` | **iopub** only (`stream`, `display_data`, `execute_result`, `error`), breaks on `status: idle` | the **shell** reply, i.e. `execute_reply.content.status` | `full = "\n".join(out).strip() or "ok"` → **`"ok"`** |
+| `_eval_expr_blocking` | **shell** only (checks `status == "error"`) | — (`aborted` is not `error`) | falls through to `return ""` → **`""`** |
+
+The kernel protocol's outcome lives in the shell reply: `execute_reply.content.status ∈ {ok, error, aborted}`. Neither function tests it, so **a cell that never executed is indistinguishable from a cell that executed and printed nothing.**
+
+### How it was found (AI-Studio Windows node, 2026-09-16)
+
+After `kernel_interrupt`, the *next* `kernel_run_python` returned the bare string `ok` while the code in that cell demonstrably never ran (a module-level marker it would have set stayed unset, and `cfx.status()` still reported the pre-cell state).
+
+The cell was not lost in transit — it was **aborted by design**. When an `interrupt_request` arrives, ipykernel sets an *aborting* flag and answers execute requests already queued behind the running cell with `_send_abort_reply` (`Kernel.dispatch_shell`, `kernelbase.py`). Standard Jupyter behaviour; the bug is only in how this bridge renders it. Because `_run_code_blocking` never reads the shell reply, it sees no output, hits `or "ok"`, and reports success.
+
+This matters most on hosts where interrupts were previously a no-op (ipykernel has no message-mode interrupt on Windows), because that is exactly when an operator starts firing cells right after an interrupt to see whether the kernel recovered — and gets `ok` for cells that were dropped. Full context: AI-Studio `WebScrapping/knowledge/windows-problems.md` §3.2 and §7.
+
+### Fix
+
+Make the outcome explicit instead of inferred:
+
+1. `_run_code_blocking`: after the iopub loop breaks on `idle`, drain the **shell** channel for the matching `msg_id` (`client.get_shell_msg(timeout=…)`, skipping other parents) and read `content.status`:
+   * `aborted` → **not** a success. Return a distinguishable signal (e.g. `{"output": …, "status": "aborted"}`) or an HTTP 409-style error; at minimum never the text `"ok"`.
+   * `error` with no `error` message captured from iopub → surface `content.ename` / `content.evalue` so the failure is not reported as empty output.
+   * `ok` → success. Keep `"ok"` as the *text* for a no-output success if backwards compatibility matters, but carry `status` alongside it so callers can tell the two apart.
+2. `_eval_expr_blocking`: same treatment — check `status == "aborted"` **before** falling through to the `user_expressions` branch, and return an explicit "aborted" rather than `""`.
+3. Consider exposing `status` in the response bodies (`RunCodeResponse`, `EvalExprResponse`) rather than only in the text — the text channel cannot express the distinction.
+
+### Test to add
+
+`tests/test_bridge.py` already has `test_interrupt_during_run`; extend it (or add a sibling) to submit a **second** run-code immediately after the interrupt and assert the response is not reported as a plain success — that reproduces the abort window deterministically.
+
+---
+
 ## Resolved (for reference)
 
 | Bug | Resolution | Commit |
