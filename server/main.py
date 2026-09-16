@@ -295,6 +295,23 @@ def _shutdown_blocking() -> None:
     _connected = True
 
 
+def _safe_log(message: str) -> None:
+    """Log without ever raising.
+
+    The bridge's stdout/stderr may be a pipe whose reader has gone away (the
+    owning pi process died, uv exited, a log rotation moved the file). A raising
+    write in the reaper's exit path used to kill the watchdog thread before it
+    could call os._exit(), leaving the bridge running forever.
+    """
+    try:
+        print(message, flush=True)
+    except Exception:
+        try:
+            os.write(2, (message + "\n").encode("utf-8", "replace"))
+        except Exception:
+            pass
+
+
 def _watch_parent(pid: int, interval: float = 5.0) -> None:
     """Exit when the process that owns this bridge disappears (BUG-10).
 
@@ -302,16 +319,48 @@ def _watch_parent(pid: int, interval: float = 5.0) -> None:
     can be reparented to init and keep running, so the bridge (and its port)
     leaks permanently — observed as orphaned bridges hours old holding ports.
     Watching pi's pid directly is immune to that reparenting.
+
+    Nothing in this loop may raise: the exit path must not depend on being able
+    to log, and the thread must never die while the process keeps serving.
     """
     while True:
         time.sleep(interval)
+        gone = False
         try:
             os.kill(pid, 0)
         except ProcessLookupError:
-            print(f"[bridge] parent process {pid} is gone — exiting", flush=True)
-            os._exit(0)
+            gone = True
         except PermissionError:
             continue  # exists, just not signalable by us
+        except BaseException as e:  # never let the reaper die silently
+            _safe_log(f"[bridge] parent watchdog: unexpected {e!r}; retrying")
+            continue
+        if gone:
+            try:
+                _safe_log(f"[bridge] parent process {pid} is gone - exiting")
+            finally:
+                os._exit(0)  # exit even if the log write failed
+
+
+def _watch_stdin() -> None:
+    """Exit as soon as the owner closes our stdin.
+
+    pi keeps the write end of this pipe open for the lifetime of the bridge, so
+    EOF is an immediate, poll-free death signal (opt-in via --stdin-watch; only
+    safe when the parent really holds a pipe, never for an inherited tty or
+    /dev/null, which would look like instant EOF).
+    """
+    try:
+        while True:
+            chunk = sys.stdin.buffer.read(65536)
+            if not chunk:
+                break
+    except Exception:
+        pass
+    try:
+        _safe_log("[bridge] owner closed stdin - exiting")
+    finally:
+        os._exit(0)
 
 
 def _get_kernel_python_blocking() -> dict[str, Any]:
@@ -523,6 +572,11 @@ def main() -> None:
         default=0,
         help="Owning process (pi); when it exits, so does this bridge",
     )
+    parser.add_argument(
+        "--stdin-watch",
+        action="store_true",
+        help="Exit when the owner closes stdin (only when the parent holds a pipe)",
+    )
     args = parser.parse_args()
 
     kernel_file = str(Path(args.kernel_file).expanduser().resolve())
@@ -532,12 +586,14 @@ def main() -> None:
 
     if parent_pid:
         threading.Thread(target=_watch_parent, args=(parent_pid,), daemon=True).start()
+    if args.stdin_watch:
+        threading.Thread(target=_watch_stdin, daemon=True).start()
 
     try:
         client = _start_client(kernel_file)
         threading.Thread(target=_connect_loop, daemon=True).start()
     except Exception as e:
-        print(f"[bridge] failed to start kernel client: {e}", file=sys.stderr)
+        _safe_log(f"[bridge] failed to start kernel client: {e}")
         client = None
 
     print(f"[bridge] kernel_file={kernel_file} port={bridge_port}", flush=True)

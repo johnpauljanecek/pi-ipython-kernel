@@ -224,10 +224,11 @@ function spawnBridge(name: string, kernelFile: string, port: number, token: stri
 		"--kernel-file", kernelFile,
 		"--port", String(port),
 		"--token", token,
-		// BUG-10: the bridge self-terminates when this pi process dies. Without
-		// it, a killed/closed pi session leaves the bridge (and its port) running
-		// forever, because the `uv run` wrapper outlives its parent.
+		// BUG-10/12: the bridge self-terminates when this pi process dies. The pid
+		// poll is the fallback; the stdin pipe is the fast path (its write end
+		// lives in this process, so EOF arrives the instant pi exits).
 		"--parent-pid", String(process.pid),
+		"--stdin-watch",
 	];
 	const logFile = join(kernelDir(name), "bridge.log");
 	const proc = execa("uv", args, {

@@ -296,6 +296,102 @@ def test_busy_request_fails_fast_with_409(session):
     assert data["busy"] is False
 
 
+def _start_standalone_bridge(tmp_path, watched_pid=None, stdin_watch=False, port=None, stdout=None):
+    """Spawn a bridge directly (no kernel), watching an arbitrary pid."""
+    port = port or free_port()
+    args = ["uv", "run", "--with", "fastapi", "--with", "uvicorn",
+            "--with", "jupyter_client", "--with", "pyzmq", "--with", "pydantic",
+            "python", str(SERVER),
+            "--kernel-file", str(tmp_path / "index.json"),
+            "--port", str(port), "--token", TOKEN]
+    if watched_pid is not None:
+        args += ["--parent-pid", str(watched_pid)]
+    if stdin_watch:
+        args += ["--stdin-watch"]
+    kwargs = {"cwd": PKG_ROOT, "start_new_session": True}
+    if stdout is not None:
+        kwargs["stdout"] = stdout
+        kwargs["stderr"] = stdout
+    else:
+        log = open(tmp_path / "standalone-bridge.log", "wb")
+        kwargs["stdout"] = log
+        kwargs["stderr"] = subprocess.STDOUT
+    proc = subprocess.Popen(args, **kwargs)
+    wait_health(port)
+    return proc, port
+
+
+def test_reaper_survives_a_failing_log_write(tmp_path):
+    # Regression: the exit path logged *before* calling os._exit(). When the log
+    # write raised (pipe closed by the dead owner), the exception killed the
+    # watchdog thread and the bridge kept serving forever — a leak that looks
+    # exactly like the original bug and left no trace in the log.
+    owner = subprocess.Popen(["sleep", "300"], start_new_session=True)
+    read_fd, write_fd = os.pipe()
+    proc = None
+    try:
+        proc, _ = _start_standalone_bridge(
+            tmp_path, watched_pid=owner.pid, stdout=write_fd
+        )
+        os.close(write_fd)
+        write_fd = None
+        os.close(read_fd)  # every further write by the bridge now raises EPIPE
+        read_fd = None
+
+        owner.kill()
+        owner.wait()
+
+        deadline = time.time() + 30
+        while time.time() < deadline and proc.poll() is None:
+            time.sleep(0.5)
+        assert proc.poll() is not None, (
+            "bridge outlived its owner because it could not log the reason"
+        )
+    finally:
+        for fd in (read_fd, write_fd):
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except Exception:
+                    pass
+        if owner.poll() is None:
+            owner.kill()
+        if proc is not None and proc.poll() is None:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except Exception:
+                proc.kill()
+
+
+def test_stdin_watch_exits_when_owner_closes_the_pipe(tmp_path):
+    # The fast path: pi holds the write end of the bridge's stdin, so EOF is an
+    # immediate death signal — no polling, no log write, nothing to go wrong.
+    proc = subprocess.Popen(
+        ["uv", "run", "--with", "fastapi", "--with", "uvicorn",
+         "--with", "jupyter_client", "--with", "pyzmq", "--with", "pydantic",
+         "python", str(SERVER),
+         "--kernel-file", str(tmp_path / "index.json"),
+         "--port", str(free_port()), "--token", TOKEN, "--stdin-watch"],
+        cwd=PKG_ROOT,
+        stdin=subprocess.PIPE,
+        stdout=open(tmp_path / "stdin-watch.log", "wb"),
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+    try:
+        proc.stdin.close()  # simulate pi exiting
+        deadline = time.time() + 30
+        while time.time() < deadline and proc.poll() is None:
+            time.sleep(0.5)
+        assert proc.poll() is not None, "bridge ignored stdin EOF"
+    finally:
+        if proc.poll() is None:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except Exception:
+                proc.kill()
+
+
 def test_bad_kernel_file_reports_error_instead_of_crashing(tmp_path):
     # Regression: main() wrote the startup error to sys.stderr without importing
     # sys, so a bridge whose kernel client could not start died with NameError
