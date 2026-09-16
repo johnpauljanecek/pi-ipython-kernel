@@ -16,7 +16,7 @@ pi install /path/to/ipython_package
 Or from npm (once published):
 
 ```bash
-pi install npm:@johnjanecek/ipyforge-kernel
+pi install npm:@johnpauljanecek/ipyforge-kernel
 ```
 
 ## Tools

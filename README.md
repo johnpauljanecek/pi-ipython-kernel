@@ -38,12 +38,12 @@ workflow where re-running setup on every step is the bottleneck.
 
 ### From npm (once published)
 ```bash
-pi install npm:@johnjanecek/ipyforge-kernel
+pi install npm:@johnpauljanecek/ipyforge-kernel
 ```
 
 ### From GitHub
 ```bash
-pi install git:github.com/johnjanecek/ipyforge-kernel
+pi install git:github.com/johnpauljanecek/ipyforge-kernel
 ```
 
 ### From local path
@@ -53,8 +53,8 @@ pi install /path/to/ipython_package
 
 ### Try without installing
 ```bash
-pi -e npm:@johnjanecek/ipyforge-kernel
-pi -e git:github.com/johnjanecek/ipyforge-kernel
+pi -e npm:@johnpauljanecek/ipyforge-kernel
+pi -e git:github.com/johnpauljanecek/ipyforge-kernel
 ```
 
 ## Tools
