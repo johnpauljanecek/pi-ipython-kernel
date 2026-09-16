@@ -22,9 +22,10 @@ import os
 import queue
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Iterator, Optional
 
 import uvicorn
 import zmq
@@ -65,11 +66,17 @@ config: BridgeConfig = load_config()
 kernel_file: str = ""
 bridge_port: int = 0
 auth_token: str | None = None
+parent_pid: int = 0
 
 client: BlockingKernelClient | None = None
 _connected: bool = False
 _shell_lock = threading.Lock()
 _control_lock = threading.Lock()
+
+# Busy tracking (BUG-D): what is occupying the shell channel right now.
+# Read without a lock — GIL-atomic, and only used for diagnostics.
+_busy_since: float | None = None
+_busy_snippet: str | None = None
 
 _last_output_full: str = ""
 _last_output_lock = threading.Lock()
@@ -107,14 +114,67 @@ def _connect_loop() -> None:
     assert client is not None
     deadline = time.monotonic() + 30.0
     while time.monotonic() < deadline:
-        try:
-            with _shell_lock:
+        # Non-blocking: never sit on the shell channel waiting for a socket
+        # reply, or a legitimate run request would be reported as "busy".
+        if _shell_lock.acquire(blocking=False):
+            try:
                 client.kernel_info()
-            _connected = True
-            return
-        except Exception:
-            time.sleep(0.5)
+                _connected = True
+                return
+            except Exception:
+                pass
+            finally:
+                _shell_lock.release()
+        time.sleep(0.5)
     _connected = False
+
+
+# ---------------------------------------------------------------------------
+# Busy guard (BUG-D)
+# ---------------------------------------------------------------------------
+
+class KernelBusy(Exception):
+    """Raised when a request arrives while another call owns the kernel."""
+
+    def __init__(self, busy_s: float, snippet: str | None) -> None:
+        self.busy_s = busy_s
+        self.snippet = snippet
+        who = f" (running: {snippet})" if snippet else ""
+        super().__init__(
+            f"Kernel is busy — a previous call has been running for {busy_s:.0f}s{who}. "
+            "Wait for it to finish, call kernel_interrupt, or raise timeout_s."
+        )
+
+
+def _snippet(code: str, limit: int = 60) -> str | None:
+    for line in code.splitlines():
+        line = line.strip()
+        if line:
+            return line[:limit]
+    return None
+
+
+@contextmanager
+def _exec_slot(code: str = "") -> Iterator[None]:
+    """Own the shell channel for one execution, failing fast when busy.
+
+    Previously a second request would block on `_shell_lock` until the caller's
+    own HTTP timeout expired, which surfaced as a bogus "cannot reach bridge".
+    Refusing immediately makes the real cause visible.
+    """
+    global _busy_since, _busy_snippet
+    if not _shell_lock.acquire(blocking=False):
+        since = _busy_since
+        elapsed = time.monotonic() - since if since is not None else 0.0
+        raise KernelBusy(elapsed, _busy_snippet)
+    _busy_since = time.monotonic()
+    _busy_snippet = _snippet(code)
+    try:
+        yield
+    finally:
+        _busy_since = None
+        _busy_snippet = None
+        _shell_lock.release()
 
 
 # ---------------------------------------------------------------------------
@@ -131,7 +191,7 @@ def _run_code_blocking(code: str, timeout: float) -> tuple[str, bool]:
     global client, _connected, _last_output_full
     if client is None:
         raise RuntimeError("Bridge has no kernel client")
-    with _shell_lock:
+    with _exec_slot(code):
         msg_id = client.execute(code, silent=False, store_history=True, allow_stdin=True)
 
         out: list[str] = []
@@ -177,7 +237,7 @@ def _eval_expr_blocking(expr: str, timeout: float) -> str:
     global client, _connected
     if client is None:
         raise RuntimeError("Bridge has no kernel client")
-    with _shell_lock:
+    with _exec_slot(f"<eval> {expr}"):
         msg_id = client.execute(
             "",
             silent=True,
@@ -234,12 +294,31 @@ def _shutdown_blocking() -> None:
     _connected = True
 
 
+def _watch_parent(pid: int, interval: float = 5.0) -> None:
+    """Exit when the process that owns this bridge disappears (BUG-10).
+
+    The bridge is launched through a `uv run` wrapper. When pi dies the wrapper
+    can be reparented to init and keep running, so the bridge (and its port)
+    leaks permanently — observed as orphaned bridges hours old holding ports.
+    Watching pi's pid directly is immune to that reparenting.
+    """
+    while True:
+        time.sleep(interval)
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            print(f"[bridge] parent process {pid} is gone — exiting", flush=True)
+            os._exit(0)
+        except PermissionError:
+            continue  # exists, just not signalable by us
+
+
 def _get_kernel_python_blocking() -> dict[str, Any]:
     """Return the kernel's own sys.executable (the bridge env may differ)."""
     global client, _connected
     if client is None:
         raise RuntimeError("Bridge has no kernel client")
-    with _shell_lock:
+    with _exec_slot("<probe sys.executable>"):
         msg_id = client.execute(
             "import sys, importlib.util; print(sys.executable); "
             "print('has_jupyter_console', importlib.util.find_spec('jupyter_console') is not None)",
@@ -332,10 +411,14 @@ def health():
 
 @kernel_router.get("/kernel/status")
 def kernel_status():
+    since = _busy_since
     return {
         "connected": _connected,
         "connection_file": kernel_file,
         "port": bridge_port,
+        "busy": since is not None,
+        "busy_s": round(time.monotonic() - since, 1) if since is not None else 0.0,
+        "running": _busy_snippet,
     }
 
 
@@ -343,6 +426,8 @@ def kernel_status():
 async def kernel_python():
     try:
         return await asyncio.to_thread(_get_kernel_python_blocking)
+    except KernelBusy as e:
+        raise HTTPException(409, detail=str(e))
     except Exception as e:
         raise HTTPException(502, detail=str(e))
 
@@ -353,6 +438,8 @@ async def kernel_run_code(req: RunCodeRequest):
     try:
         truncated, was_truncated = await asyncio.to_thread(_run_code_blocking, req.code, timeout)
         return {"output": truncated, "truncated": was_truncated}
+    except KernelBusy as e:
+        raise HTTPException(409, detail=str(e))
     except TimeoutError as e:
         raise HTTPException(504, detail=f"Execution failed or timed out: {e}")
     except Exception as e:
@@ -365,6 +452,8 @@ async def kernel_eval_expr(req: EvalExprRequest):
     try:
         result = await asyncio.to_thread(_eval_expr_blocking, req.expr, timeout)
         return {"result": result}
+    except KernelBusy as e:
+        raise HTTPException(409, detail=str(e))
     except TimeoutError as e:
         raise HTTPException(504, detail=f"Expression eval failed or timed out: {e}")
     except Exception as e:
@@ -421,17 +510,27 @@ app.include_router(kernel_router)
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    global kernel_file, bridge_port, auth_token, client
+    global kernel_file, bridge_port, auth_token, parent_pid, client
 
     parser = argparse.ArgumentParser(description="ipyforge-kernel-bridge")
     parser.add_argument("--kernel-file", required=True, help="Path to kernel.json")
     parser.add_argument("--port", type=int, required=True, help="HTTP port to bind")
     parser.add_argument("--token", default=None, help="Optional auth token")
+    parser.add_argument(
+        "--parent-pid",
+        type=int,
+        default=0,
+        help="Owning process (pi); when it exits, so does this bridge",
+    )
     args = parser.parse_args()
 
     kernel_file = str(Path(args.kernel_file).expanduser().resolve())
     bridge_port = args.port
     auth_token = args.token or None
+    parent_pid = args.parent_pid or 0
+
+    if parent_pid:
+        threading.Thread(target=_watch_parent, args=(parent_pid,), daemon=True).start()
 
     try:
         client = _start_client(kernel_file)

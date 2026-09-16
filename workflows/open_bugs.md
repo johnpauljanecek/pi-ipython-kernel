@@ -135,11 +135,14 @@ regardless of cwd.
 
 ---
 
-## BUG-09: Fresh `BlockingKernelClient` per request leaks ZMQ sockets
+## ~~BUG-09: Fresh `BlockingKernelClient` per request leaks ZMQ sockets~~ ✅ RESOLVED
 
 **Severity:** High (blocks long-lived per-kernel bridge in step 17)
 **File:** `server/main.py` (`_connect` + every endpoint's `finally: client.stop_channels()`)
-**Status:** Open — fix in Phase B
+**Status:** RESOLVED in `e8d03e7` (Phase B: per-kernel bridge + named kernel registry).
+Regression test: `tests/test_bridge.py::test_no_socket_leak_under_sustained_use`
+(20 consecutive `run-code` calls must all succeed; the old code died at ~7 with
+`zmq.error.ZMQError: Too many open files`).
 
 Every endpoint calls `_connect()` which creates a **new** `BlockingKernelClient`
 (`start_channels()` → 5 channel threads each with a ZMQ socket), and cleans up
@@ -152,7 +155,7 @@ requests, observed empirically) channel threads fail with
 `zmq.error.ZMQError: Too many open files`. The current server survives only
 because it is short-lived and traffic is bursty.
 
-**Fix (Phase B):** the per-kernel bridge owns **one** `BlockingKernelClient`
+**Resolution (shipped):** the per-kernel bridge owns **one** `BlockingKernelClient`
 created at startup and reused across all requests (close it on bridge
 `/shutdown`). This is the natural per-kernel-bridge design — the bridge knows
 its kernel's connection file at spawn — and it eliminates the create/stop cycle
@@ -332,6 +335,76 @@ not in the same process group does not take the child with it.
 
 ---
 
+## ~~BUG-10: Timeouts reported as "Cannot reach kernel bridge"~~ ✅ RESOLVED
+
+**Severity:** High — a misdiagnosis that sends the agent to restart a *healthy* bridge  
+**File:** `extensions/index.ts` (`kernelPost` / `kernelGet` catch blocks)
+
+Every fetch failure — including a client-side `AbortSignal.timeout` — was wrapped
+in `Cannot reach kernel bridge for '<name>'`. When a long call exceeds the client
+timeout the bridge is fine and the kernel is simply still executing; the message
+blamed the network instead. The natural remedy for "cannot reach bridge" is to
+restart it, which destroys exactly the state the kernel exists to hold. This cost
+20 minutes of live debugging while the bridge was healthy throughout.
+
+**Resolution:** failures are classified in `bridgeFailure()`:
+
+| Cause | Message |
+|-------|---------|
+| caller aborted the tool call | "was cancelled — the kernel may still be running that code" |
+| timeout | "did not answer within Ns; the bridge is up and the kernel is still busy" + suggests `kernel_interrupt`, a larger `timeout_s`, or `kernel_get_output` |
+| `ECONNREFUSED` / `ECONNRESET` / `EPIPE` | "not accepting connections on port N — retry to respawn the bridge" (the only case where that advice is correct) |
+| anything else | raw cause, still attributed to the port |
+
+---
+
+## ~~BUG-11: Requests silently queued behind a busy kernel~~ ✅ RESOLVED
+
+**Severity:** High — a busy kernel is indistinguishable from a dead bridge  
+**File:** `server/main.py` (lock acquisition in the execution helpers)
+
+`_shell_lock` serialized execution correctly, but a second request *waited* on it
+until the caller's own HTTP timeout expired — surfacing as BUG-10's bogus
+connectivity error. Observed live: after a single long `om.eval` timed out, even
+trivial calls failed until the in-flight work finished.
+
+**Resolution:** `_exec_slot()` acquires the lock with `acquire(blocking=False)`
+and raises `KernelBusy` when the kernel is occupied; the endpoints translate that
+to **HTTP 409** carrying the elapsed time and the code currently running.
+`/kernel/status` gained `busy`, `busy_s`, and `running`, and stays answerable
+during a run — as do `/kernel/interrupt` and `/kernel/get-output` — so there is
+always a way out. The extension renders a 409 as a distinct "kernel is busy"
+message, and `kernel_status` prints the busy line.
+
+Regression test: `tests/test_bridge.py::test_busy_request_fails_fast_with_409`
+(asserts 409 in under 3 s while a 4 s run is in flight).
+
+---
+
+## ~~BUG-12: No bridge reaper — orphaned bridges leak ports forever~~ ✅ RESOLVED
+
+**Severity:** Medium — slow resource leak whose symptom mimics BUG-10  
+**File:** `extensions/index.ts` (`spawnBridge`), `server/main.py`
+
+Bridges were killed only by an explicit `kernel_stop` or a package reload. When a
+pi session died — crash, Ctrl-C, closed terminal — nothing cleaned up, and since
+the `uv run` wrapper is reparented to init and keeps running, a naive
+`getppid()` check would not have caught it either. Observed on this machine: two
+orphaned bridges for one dead kernel, **7 h and 2 h old**, each holding a port and
+~5 ZMQ sockets.
+
+**Resolution:** `spawnBridge` passes `--parent-pid <pi pid>`; the bridge runs
+`_watch_parent()`, polling that pid and `os._exit(0)`ing once it disappears.
+Legacy orphans spawned before this fix still need one manual sweep:
+
+```bash
+pgrep -fl "server/main.py"     # then kill the uv wrapper and its python child
+```
+
+Regression test: `tests/test_bridge.py::test_bridge_exits_when_parent_dies`.
+
+---
+
 ## Resolved (for reference)
 
 | Bug | Resolution | Commit |
@@ -340,3 +413,4 @@ not in the same process group does not take the child with it.
 | `node_modules/` / `.pi/` not gitignored | Added to `.gitignore` | `8265476` |
 | `extensions/README.md` stale (6→8 tools, old install) | Rewritten with all 8 tools + pi package install | `8265476` |
 | No timeouts — hangs in kernel_status and all tools | `AbortSignal.timeout()` on fetch, ZMQ socket timeouts, health polling | `859aa46` |
+| `package.json` npm scope was `@johnjanecek` while the account (and README) said `johnpauljanecek` | Renamed to the unscoped `pi-ipython-kernel` (verified free on npm) | — |

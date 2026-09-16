@@ -72,12 +72,13 @@ def wait_health(port: int, timeout: float = 60) -> None:
 class Session:
     """A running kernel + bridge pair."""
 
-    def __init__(self, tmpdir: Path):
+    def __init__(self, tmpdir: Path, extra_bridge_args: list[str] | None = None):
         self.tmpdir = tmpdir
         self.kernel_file = tmpdir / "kernel.json"
         self.port = free_port()
         self.kernel_proc: subprocess.Popen | None = None
         self.bridge_proc: subprocess.Popen | None = None
+        self.extra_bridge_args = extra_bridge_args or []
 
     def start(self) -> None:
         self.kernel_proc = subprocess.Popen(
@@ -98,7 +99,8 @@ class Session:
              "--with", "jupyter_client", "--with", "pyzmq", "--with", "pydantic",
              "python", str(SERVER),
              "--kernel-file", str(self.kernel_file),
-             "--port", str(self.port), "--token", TOKEN],
+             "--port", str(self.port), "--token", TOKEN,
+             *self.extra_bridge_args],
             cwd=PKG_ROOT,
             stdout=open(self.tmpdir / "bridge.log", "wb"),
             stderr=subprocess.STDOUT,
@@ -232,3 +234,86 @@ def test_no_socket_leak_under_sustained_use(session):
     for _ in range(20):
         status, data = http("POST", url(session, "/kernel/run-code"), {"code": "1"}, TOKEN)
         assert status == 200, f"request failed under sustained use: {data}"
+
+
+def test_busy_request_fails_fast_with_409(session):
+    # BUG-D regression: a request arriving while the kernel is executing used to
+    # queue silently until the *caller's* HTTP timeout fired, which the extension
+    # then reported as "cannot reach kernel bridge". It must instead be refused
+    # immediately with 409 + a description of what is running.
+    result: dict = {}
+
+    def long_run():
+        try:
+            result["status"], result["data"] = http(
+                "POST",
+                url(session, "/kernel/run-code"),
+                {"code": "import time; time.sleep(4); 'LONG_DONE'"},
+                TOKEN,
+                timeout=60,
+            )
+        except Exception as e:  # surfaced by the assertions below
+            result["error"] = repr(e)
+
+    t = threading.Thread(target=long_run)
+    t.start()
+
+    # Wait until the bridge reports itself busy.
+    deadline = time.time() + 10
+    busy = False
+    while time.time() < deadline:
+        status, data = http("GET", url(session, "/kernel/status"), token=TOKEN)
+        assert status == 200
+        if data.get("busy"):
+            busy = True
+            assert data.get("busy_s", 0) >= 0
+            assert data.get("running"), "busy status must name what is running"
+            break
+        time.sleep(0.1)
+    assert busy, "bridge never reported busy during a 4s run"
+
+    # A second execution request must be refused, not queued.
+    t0 = time.time()
+    status, data = http("POST", url(session, "/kernel/run-code"), {"code": "1"}, TOKEN, timeout=30)
+    elapsed = time.time() - t0
+    assert status == 409, f"expected 409 while busy, got {status}: {data}"
+    assert "busy" in str(data.get("detail", "")).lower(), data
+    assert elapsed < 3.0, f"busy request took {elapsed:.1f}s — it queued instead of failing fast"
+
+    # status must stay answerable while the kernel is occupied.
+    status, data = http("GET", url(session, "/kernel/status"), token=TOKEN)
+    assert status == 200 and data["busy"] is True
+
+    t.join(timeout=60)
+    assert result.get("error") is None, result
+    assert result["status"] == 200, result
+    assert "LONG_DONE" in result["data"]["output"], result
+
+    # Once the run finishes the kernel accepts work again.
+    status, data = http("POST", url(session, "/kernel/run-code"), {"code": "'after'"}, TOKEN)
+    assert status == 200 and "after" in data["output"], data
+    status, data = http("GET", url(session, "/kernel/status"), token=TOKEN)
+    assert data["busy"] is False
+
+
+def test_bridge_exits_when_parent_dies(tmp_path):
+    # BUG-10 regression: a bridge outlives its pi session, leaking a port and
+    # ~5 ZMQ sockets forever (observed: orphaned bridges hours old on a machine
+    # with no live session). With --parent-pid the bridge watches the owner.
+    owner = subprocess.Popen(["sleep", "300"], start_new_session=True)
+    s = Session(tmp_path, extra_bridge_args=["--parent-pid", str(owner.pid)])
+    try:
+        s.start()
+        assert s.bridge_proc is not None and s.bridge_proc.poll() is None
+
+        owner.kill()
+        owner.wait()
+
+        deadline = time.time() + 30
+        while time.time() < deadline and s.bridge_proc.poll() is None:
+            time.sleep(0.5)
+        assert s.bridge_proc.poll() is not None, "bridge outlived its owner"
+    finally:
+        if owner.poll() is None:
+            owner.kill()
+        s.stop()

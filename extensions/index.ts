@@ -164,6 +164,28 @@ async function bridgeHealthy(port: number): Promise<boolean> {
 	}
 }
 
+/**
+ * Read /kernel/status straight from a known port — never respawns a bridge,
+ * so it is safe to call for diagnostics. Returns null when unreachable.
+ */
+async function bridgeState(
+	port: number,
+	authToken?: string | null,
+): Promise<Record<string, unknown> | null> {
+	try {
+		const headers: Record<string, string> = {};
+		if (authToken) headers["X-IPY-TOKEN"] = authToken;
+		const res = await fetch(`http://127.0.0.1:${port}/kernel/status`, {
+			headers,
+			signal: AbortSignal.timeout(CONTROL_TIMEOUT_MS),
+		});
+		if (!res.ok) return null;
+		return (await res.json()) as Record<string, unknown>;
+	} catch {
+		return null;
+	}
+}
+
 async function waitForHealth(port: number, timeoutMs: number): Promise<void> {
 	const deadline = Date.now() + timeoutMs;
 	while (Date.now() < deadline) {
@@ -202,6 +224,10 @@ function spawnBridge(name: string, kernelFile: string, port: number, token: stri
 		"--kernel-file", kernelFile,
 		"--port", String(port),
 		"--token", token,
+		// BUG-10: the bridge self-terminates when this pi process dies. Without
+		// it, a killed/closed pi session leaves the bridge (and its port) running
+		// forever, because the `uv run` wrapper outlives its parent.
+		"--parent-pid", String(process.pid),
 	];
 	const logFile = join(kernelDir(name), "bridge.log");
 	const proc = execa("uv", args, {
@@ -260,6 +286,77 @@ function httpSignal(timeoutS: number | undefined, signal?: AbortSignal): AbortSi
 	return signal ? AbortSignal.any([signal, AbortSignal.timeout(ms)]) : AbortSignal.timeout(ms);
 }
 
+interface ErrLike {
+	name?: string;
+	message?: string;
+	code?: string;
+	cause?: { name?: string; code?: string; message?: string };
+}
+
+function isTimeout(err: unknown): boolean {
+	const e = err as ErrLike;
+	const names = [e?.name, e?.cause?.name];
+	return (
+		names.includes("TimeoutError") ||
+		/aborted due to timeout|timed out|timeout/i.test(String(e?.message ?? ""))
+	);
+}
+
+function isConnectionLost(err: unknown): boolean {
+	const e = err as ErrLike;
+	const code = e?.cause?.code ?? e?.code;
+	return (
+		code === "ECONNREFUSED" ||
+		code === "ECONNRESET" ||
+		code === "EPIPE" ||
+		/ECONNREFUSED|ECONNRESET|socket hang up/i.test(String(e?.message ?? ""))
+	);
+}
+
+/**
+ * Turn a failed bridge request into an error that names the real cause.
+ *
+ * A client-side timeout used to be reported as "cannot reach kernel bridge",
+ * which sends you off restarting a perfectly healthy bridge while the kernel is
+ * simply still executing the previous call.
+ */
+function bridgeFailure(
+	name: string,
+	port: number,
+	err: unknown,
+	timeoutS: number | undefined,
+	callerAborted: boolean,
+): Error {
+	if (callerAborted) {
+		return new Error(
+			`Call to kernel '${name}' was cancelled. The kernel may still be running that code — ` +
+				`use kernel_interrupt or kernel_status to check.`,
+		);
+	}
+	if (isTimeout(err)) {
+		const secs = timeoutS !== undefined ? timeoutS + TIMEOUT_MARGIN_S : CONTROL_TIMEOUT_MS / 1000;
+		return new Error(
+			`Kernel '${name}' did not answer within ${secs}s. The bridge is up — the kernel is still busy ` +
+				`with a previous call.\nUse kernel_interrupt to stop it, or call again with a larger timeout_s.\n` +
+				`kernel_get_output may still return that call's output once it finishes.`,
+		);
+	}
+	if (isConnectionLost(err)) {
+		return new Error(
+			`Kernel bridge for '${name}' is not accepting connections on port ${port} ` +
+				`(${errMsg(err)}).\nRetry the call — it will respawn the bridge for this kernel.`,
+		);
+	}
+	return new Error(`Kernel bridge request for '${name}' failed on port ${port}: ${errMsg(err)}`);
+}
+
+function busyFailure(name: string, detail: string): Error {
+	return new Error(
+		`Kernel '${name}' is busy and refused the request.\n${detail}\n` +
+			`Options: wait, call kernel_interrupt, or raise timeout_s.`,
+	);
+}
+
 async function kernelPost(
 	name: string,
 	endpoint: string,
@@ -280,12 +377,13 @@ async function kernelPost(
 			signal: httpSignal(opts.timeoutS, opts.signal),
 		});
 	} catch (err) {
-		throw new Error(`Cannot reach kernel bridge for '${name}'.\n${errMsg(err)}`);
+		throw bridgeFailure(name, port, err, opts.timeoutS, opts.signal?.aborted === true);
 	}
 
 	const data = (await res.json()) as Record<string, unknown>;
 	if (!res.ok) {
 		const detail = typeof data.detail === "string" ? data.detail : `HTTP ${res.status}`;
+		if (res.status === 409) throw busyFailure(name, detail);
 		throw new Error(`Server error: ${detail}`);
 	}
 	return data;
@@ -308,12 +406,13 @@ async function kernelGet(
 			signal: httpSignal(opts.timeoutS, opts.signal),
 		});
 	} catch (err) {
-		throw new Error(`Cannot reach kernel bridge for '${name}'.\n${errMsg(err)}`);
+		throw bridgeFailure(name, port, err, opts.timeoutS, opts.signal?.aborted === true);
 	}
 
 	const data = (await res.json()) as Record<string, unknown>;
 	if (!res.ok) {
 		const detail = typeof data.detail === "string" ? data.detail : `HTTP ${res.status}`;
+		if (res.status === 409) throw busyFailure(name, detail);
 		throw new Error(`Server error: ${detail}`);
 	}
 	return data;
@@ -911,6 +1010,15 @@ export default function (pi: ExtensionAPI) {
 					const bridgeUp = await bridgeHealthy(meta.bridge_port);
 					lines.push(`🔗 Connected kernel: ${meta.name}`);
 					lines.push(`   Bridge: ${bridgeUp ? "✅ up" : "❌ down"} (port ${meta.bridge_port})`);
+					if (bridgeUp) {
+						const st = await bridgeState(meta.bridge_port, meta.auth_token);
+						if (st?.busy) {
+							const running = st.running ? ` — ${st.running}` : "";
+							lines.push(`   Busy: ⏳ yes, running for ${st.busy_s}s${running}`);
+						} else if (st) {
+							lines.push("   Busy: no (idle)");
+						}
+					}
 					lines.push(`   Kernel PID: ${meta.kernel_pid}${meta.external ? " (external)" : ""}`);
 					lines.push(`   Python: ${meta.python || "(default)"}`);
 					lines.push(`   Cwd: ${meta.cwd || "—"}`);
