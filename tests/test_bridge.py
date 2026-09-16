@@ -296,6 +296,41 @@ def test_busy_request_fails_fast_with_409(session):
     assert data["busy"] is False
 
 
+def test_bad_kernel_file_reports_error_instead_of_crashing(tmp_path):
+    # Regression: main() wrote the startup error to sys.stderr without importing
+    # sys, so a bridge whose kernel client could not start died with NameError
+    # before uvicorn came up — the caller saw only a health-check timeout, and
+    # the real cause (missing/invalid kernel file) was lost entirely.
+    port = free_port()
+    log = tmp_path / "bad-kernel-bridge.log"
+    missing = tmp_path / "missing-kernel.json"
+    proc = subprocess.Popen(
+        ["uv", "run", "--with", "fastapi", "--with", "uvicorn",
+         "--with", "jupyter_client", "--with", "pyzmq", "--with", "pydantic",
+         "python", str(SERVER),
+         "--kernel-file", str(missing), "--port", str(port), "--token", TOKEN],
+        cwd=PKG_ROOT,
+        stdout=open(log, "wb"),
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+    try:
+        wait_health(port)  # the bridge must still come up and serve
+        status, data = http("POST", f"http://127.0.0.1:{port}/kernel/run-code", {"code": "1"}, TOKEN)
+        assert status == 502, data
+        assert any("no kernel client" in str(v).lower() for v in data.values()), data
+
+        text = log.read_text(errors="replace")
+        assert "NameError" not in text, text
+        assert "failed to start kernel client" in text, text
+        assert "connection file not found" in text.lower(), text
+    finally:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except Exception:
+            proc.kill()
+
+
 def test_bridge_exits_when_parent_dies(tmp_path):
     # BUG-10 regression: a bridge outlives its pi session, leaking a port and
     # ~5 ZMQ sockets forever (observed: orphaned bridges hours old on a machine
