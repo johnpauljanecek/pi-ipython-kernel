@@ -203,9 +203,17 @@ function spawnKernel(kernelFile: string, python: string, cwd: string, logFile: s
 	const proc = execa("uv", buildKernelCommand(python, kernelFile), {
 		cwd,
 		detached: true,
+		// BUG-13: `cleanup` (default true) kills children when pi exits, which
+		// would make "kernels outlive the session" false on any graceful quit —
+		// it only appeared to work when pi was killed hard enough to skip it.
+		cleanup: false,
 		stdout: { file: logFile },
 		stderr: { file: logFile },
 	});
+	// Let pi exit: an un-unref'd child handle keeps node's event loop alive, so
+	// a scripted `pi -p` run that starts a kernel never terminates (observed:
+	// 10.6s without a kernel, still running after 400s with one).
+	proc.unref();
 	proc.catch(() => {
 		/* process exit tracked separately; errors surface via kernel.json / log */
 	});
@@ -234,9 +242,14 @@ function spawnBridge(name: string, kernelFile: string, port: number, token: stri
 	const proc = execa("uv", args, {
 		cwd: getExtensionDir(),
 		detached: true,
+		// Same as the kernel: never kill the bridge from a parent exit hook, and
+		// never hold pi's event loop open. The bridge reaps itself instead — it
+		// watches this pi process and stdin (BUG-12).
+		cleanup: false,
 		stdout: { file: logFile },
 		stderr: { file: logFile },
 	});
+	proc.unref();
 	proc.catch(() => {
 		/* bridge exit tracked via health checks */
 	});
