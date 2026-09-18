@@ -341,12 +341,13 @@ because they were filed, and labelled, separately.
 
 ---
 
-## BUG-12: `kernel_stop` can leave processes behind — an orphaned bridge, and no process-group kill
+## ~~BUG-12: `kernel_stop` can leave processes behind — an orphaned bridge, and no process-group kill~~ ✅ RESOLVED
 
 **Severity:** Low (bounded — the leaked bridge reaps itself when pi exits)
-**File:** `extensions/index.ts` (`kernel_stop` handler, `stopBridge`)
-**Status:** Partly corrected 2026-09-18: the original headline symptom does **not**
-reproduce; a smaller real defect was found in its place
+**File:** `extensions/index.ts` (`kernel_stop` handler, `stopBridge`), `extensions/lib.ts` (`killTree`, `pidsInGroup`)
+**Commit:** `8bf62d2`
+**Status:** RESOLVED 2026-09-18 — the original headline symptom does **not**
+reproduce; the two real defects found in its place are fixed
 
 ### Original report (2026-09-16) — not reproducible
 
@@ -378,29 +379,49 @@ the bridge to send `shutdown_request` over the control channel, keyed by the
 **connection file**, and a bridge reaches a kernel whose wrapper is long gone.
 So the original symptom is not reachable by stopping a kernel.
 
-### What is still wrong
+### What was still wrong — and the fix (`8bf62d2`)
 
-1. **A bridge is orphaned by a stop whose bridge was already dead** — reproduced
+1. **A bridge was orphaned by a stop whose bridge was already dead** — reproduced
 twice on 2026-09-18 (pids 97544, 98533). `kernelPost` respawns a bridge to reach
-the kernel; `stopBridge(meta)` then kills the **stale** `meta.bridge_pid`
-recorded at spawn time, so the *fresh* bridge survives, serving a kernel whose
-registry entry has just been deleted. It holds a port until pi exits — it carries
+the kernel; `stopBridge(meta)` then killed the **stale** `meta.bridge_pid`
+recorded at spawn time, so the *fresh* bridge survived, serving a kernel whose
+registry entry had just been deleted. It held a port until pi exits — it carries
 `--parent-pid` + `--stdin-watch`, so it does reap itself then, which is why this
-is a bounded leak rather than a permanent orphan. This is the *normal* case after
-a pi restart, since every bridge reaps itself when its pi exits.
-   Fix: resolve the bridge's **current** pid at stop time (re-read `meta.json`),
-   not the pid captured when the kernel was started.
+was a bounded leak rather than a permanent orphan. This is the *normal* case
+after a pi restart, since every bridge reaps itself when its pi exits.
+   **Fixed:** `stopBridge` re-reads `meta.json` at call time, so it kills the
+   bridge that is running now (the respawned one included).
 2. **No process-group kill.** `d824342` added `process.kill(-savedPid)`;
-   `dbeb441`'s rewrite dropped it and nothing replaced it. Today the stop path
-   only ever signals a single wrapper pid, so the defence this entry used to
-   claim is not in the code.
-   Fix: `process.kill(-meta.kernel_pid, "SIGKILL")` — the spawn is `detached: true`,
-   so the child *is* a process-group leader — keeping the single-pid attempt as a
-   fallback.
-3. **No post-stop verification**, so any future leak is again reported as success.
-   Fix: after the kill, confirm nothing is LISTENING on the kernel's control or
-   shell ports (or matching the connection-file path) and only then print
-   "stopped".
+   `dbeb441`'s rewrite dropped it and nothing replaced it — the stop path only
+ever signalled a single wrapper pid. Kernels and bridges are `uv run … python`
+pairs, so the group outlives its leader.
+   **Fixed:** `killTree()` signals the whole group, with a single-pid fallback,
+   for both the kernel and the bridge. It only targets a group after confirming
+the pid really is a group leader (`ps -o pgid= -p <pid>`), because process groups
+are keyed by a leader's pid and signalling `-pid` on a recycled pid could reach an
+unrelated group.
+3. **No post-stop verification**, so any leak was again reported as success.
+   **Fixed:** the stop polls the kernel's process group and the bridge pid for up
+to 3 s. Leftovers now produce *"did not stop cleanly — still alive: …"* and the
+registry entry is **kept** (deleting it is what made the failure invisible); only
+a clean stop prints *"stopped (… ; no processes left)"*.
+
+### Verification (2026-09-18)
+
+Against the real tools, with a nested pi running the fixed code: start → kill the
+bridge's process group (simulating a bridge that already reaped) → `kernel_stop`.
+The bridge respawned by the stop appeared as a child of that pi at **10:48:47**
+and was gone at **10:48:49 while the pi was still alive** (`pi-alive-at-last-
+sighting=True`) — killed by the fix rather than reaped by its exit — and the
+registry came back clean. The session that ran the test still had the *old* code
+loaded, and it leaked a bridge on the same operation (pid 2815): before and after
+in one window.
+
+New tests (unit 19, was 15): `isGroupLeader` distinguishes a detached leader from
+a child sharing our group; `killTree` reaps a detached leader *and the grandchild
+under it* and leaves no group members; and `killTree` on a non-leader signals only
+that pid — a bystander in the shared group survives, which is the property that
+keeps this from becoming a pattern kill.
 
 ### Why it matters
 
@@ -420,18 +441,18 @@ a pi restart, since every bridge reaps itself when its pi exits.
 The original fix list said `pkill -f "<kernel.json path>"`. Do **not** do that —
 it contradicts the hard-won rule that no pattern-based kill runs on this machine
 (a stray `pkill -9 -f "cat"` once matched 41 unrelated processes). Kill the
-process **group** by pid instead:
+process **group** by pid instead, and only after confirming the pid is a group
+leader — which is what shipped in `8bf62d2`:
 
-1. **Verify after stopping**: after the graceful attempt, check that nothing is
-   LISTENING on the kernel's control/shell ports (or that no process matches the
-   connection-file path) and only then report success.
-2. **Kill the group, not the handle**: `process.kill(-pid)` with the single-pid
-   attempt as fallback.
-3. **Report what was actually killed** (PIDs), and warn when a graceful shutdown
-   did not take effect instead of printing a success line.
+1. **Verify after stopping**: poll the kernel's process group and the bridge pid,
+   and report leftovers instead of success. Done.
+2. **Kill the group, not the handle**: `killTree()` — `process.kill(-pid)` behind an
+   `isGroupLeader()` guard, single-pid fallback. Done.
+3. **Report what was actually killed** (PIDs) and warn when a graceful shutdown
+   did not take effect. Done.
 4. Cheap detection at startup: on `kernel_start`/`kernel_list`, look for orphaned
    `ipykernel -f <path>` processes whose registry entry is gone and offer to reap
-   them.
+   them. **Still open** — not part of this fix.
 
 ---
 
