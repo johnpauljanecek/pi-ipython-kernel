@@ -350,6 +350,7 @@ npm run test:bridge      # uv run pytest tests/test_bridge.py -v
 
 ## Documentation
 
+- [Install workflow](workflows/installs/001-install-pi-ipython-kernel.md) — the procedure to follow, with checks and rollback
 - [uv tool environment setup](docs/uv-tool-env-setup.md)
 - [Kitty remote control](docs/useful_kitty.md)
 - [ipy skill](skills/ipy/SKILL.md)
