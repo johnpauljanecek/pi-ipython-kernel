@@ -29,21 +29,21 @@ Pi skill for controlling IPython kernels. Each kernel is a **persistent named re
 - **No idle timeout.** Clean up manually via `kernel_list` + `kernel_stop`.
 - Each kernel has a **companion bridge** (its own port, its own output cache). It is
   session-scoped: when the pi process that spawned it exits, the bridge reaps itself
-  (BUG-12) while the kernel keeps running. The next session respawns the bridge on
+  (BUG-16) while the kernel keeps running. The next session respawns the bridge on
   demand — the kernel's state survives, the bridge's output cache does not.
 - tmux is **not** required for persistence — it is only needed to keep *pi itself* alive across ssh disconnects.
 
 ## Busy kernels and timeouts
 
 A kernel executes one thing at a time. While a call is running, another execution
-request is refused immediately with **HTTP 409** (BUG-11) rather than queued:
+request is refused immediately with **HTTP 409** (BUG-15) rather than queued:
 
 - the error reads *"Kernel '<name>' is busy and refused the request"* and names the
   code that is running plus how long it has been running;
 - `kernel_status` prints a `Busy:` line, and works *during* a run — as do
   `kernel_interrupt` and `kernel_get_output`;
 - `kernel_get_output` can still return the previous call's full output after a
-  client-side timeout (BUG-10), so a timeout is not data loss.
+  client-side timeout (BUG-14), so a timeout is not data loss.
 
 A message *"did not answer within Ns"* means the bridge is healthy and the kernel is
 still working — raise `timeout_s`, or use `kernel_interrupt`. Only

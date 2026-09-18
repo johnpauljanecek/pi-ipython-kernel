@@ -428,7 +428,7 @@ def test_bad_kernel_file_reports_error_instead_of_crashing(tmp_path):
 
 
 def test_bridge_exits_when_parent_dies(tmp_path):
-    # BUG-10 regression: a bridge outlives its pi session, leaking a port and
+    # BUG-16 regression: a bridge outlives its pi session, leaking a port and
     # ~5 ZMQ sockets forever (observed: orphaned bridges hours old on a machine
     # with no live session). With --parent-pid the bridge watches the owner.
     owner = subprocess.Popen(["sleep", "300"], start_new_session=True)

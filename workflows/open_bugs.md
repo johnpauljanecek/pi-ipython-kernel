@@ -1,5 +1,14 @@
 # Open Bugs
 
+> **Numbering (2026-09-18).** Numbers 10/11/12 were allocated twice on
+> 2026-09-16. The kernel-lifecycle trio was filed first — §10 aborted cell
+> (14:56), §11 shell lock (16:15), §12 `kernel_stop` child (16:40) — so it keeps
+> those numbers, and they are what the AI-Studio notes cite. The bridge-honesty
+> trio, written into the tree eight minutes later by `541603e`, was also
+> labelled "BUG-10/11/12" in that commit; **it is renumbered here to 14/15/16**.
+> That commit's message still says 10/11/12 — read it as 14/15/16. `528a952` had
+> already taken 13a/13b, recorded below as §13.
+
 ## ~~BUG-01: `kernel_start` unawaited execa promise — errors silently swallowed~~ ✅ RESOLVED
 
 **Severity:** Medium  
@@ -168,7 +177,7 @@ entirely. If a fresh-client pattern is ever needed, call `client.close()`
 
 **Severity:** Medium (silent data loss: a cell that never ran looks like a clean success)
 **File:** `server/main.py` (`_run_code_blocking` L133–172, `_eval_expr_blocking` L176–214)
-**Status:** Open
+**Status:** Open, but **not reachable through the bridge as of 2026-09-18** (see below)
 
 ### What happens
 
@@ -189,6 +198,31 @@ The cell was not lost in transit — it was **aborted by design**. When an `inte
 
 This matters most on hosts where interrupts were previously a no-op (ipykernel has no message-mode interrupt on Windows), because that is exactly when an operator starts firing cells right after an interrupt to see whether the kernel recovered — and gets `ok` for cells that were dropped. Full context: AI-Studio `WebScrapping/knowledge/windows-problems.md` §3.2 and §7.
 
+### Reachability re-check (2026-09-18)
+
+The defect is still in the code — the shell reply is still unread, and
+`_run_code_blocking` still ends `full = "\n".join(out).strip() or "ok"` — but the
+window that produced the original report no longer opens **through the bridge**:
+
+* the abort reply goes to execute requests *queued behind* a running cell;
+* since `541603e` (§15), `_exec_slot()` refuses a second execution with **HTTP
+  409** while one is in flight, so the bridge cannot queue one, and there is
+  nothing for ipykernel to abort.
+
+Two attempts to reproduce it by hand, both negative:
+
+| Attempt | Result |
+|---|---|
+| interrupt 3 s into a 25 s cell, then submit `print("RAN")` | next cell ran (`RAN` returned), `MARKER` side effect present |
+| interrupt while **idle**, then submit a cell | next cell ran, printed, and set its variable |
+
+**Residual reachability:** a *human* console client (`kernel_console_cmd`) submits
+cells straight to the kernel, bypassing the bridge's lock — a console cell queued
+behind an agent cell can still be aborted, and the bridge would still render it as
+success. The fix below is therefore still worth making; it is no longer urgent, and
+it should not be described as "what happens after an interrupt" without the caveat
+that the bridge now refuses to queue.
+
 ### Fix
 
 Make the outcome explicit instead of inferred:
@@ -200,17 +234,23 @@ Make the outcome explicit instead of inferred:
 2. `_eval_expr_blocking`: same treatment — check `status == "aborted"` **before** falling through to the `user_expressions` branch, and return an explicit "aborted" rather than `""`.
 3. Consider exposing `status` in the response bodies (`RunCodeResponse`, `EvalExprResponse`) rather than only in the text — the text channel cannot express the distinction.
 
+Note for whoever makes this change: a bridge runs whatever `server/main.py`
+existed when it was **spawned**, and nothing refreshes it. After editing the
+bridge, restart each long-lived bridge (`kill` its pids from `meta.json`, then
+`kernel_connect <name>`) or the fix will appear to do nothing. The kernel and its
+state survive that restart — only the proxy is replaced.
+
 ### Test to add
 
 `tests/test_bridge.py` already has `test_interrupt_during_run`; extend it (or add a sibling) to submit a **second** run-code immediately after the interrupt and assert the response is not reported as a plain success — that reproduces the abort window deterministically.
 
 ---
 
-## BUG-11: One bad reply can wedge the whole bridge — no timeout on the shell lock
+## ~~BUG-11: One bad reply can wedge the whole bridge — no timeout on the shell lock~~ ✅ RESOLVED
 
 **Severity:** High (the bridge looks dead; only killing it recovers; the kernel is fine)
 **File:** `server/main.py` (`_eval_expr_blocking`, `_run_code_blocking`, the `_shell_lock` in both)
-**Status:** Open — found 2026-09-16 while driving a live kernel
+**Status:** RESOLVED by `541603e` (§15) — found 2026-09-16 while driving a live kernel
 
 ### Symptom
 
@@ -284,15 +324,31 @@ lsof -tiTCP:<bridge_port> -sTCP:LISTEN | xargs kill      # port from ~/.ipy/kern
 case the kernel had also queued the earlier request, so an interrupt *was* worth sending once, but it was the
 bridge restart that actually recovered the session.
 
+### Resolution (`541603e`, re-verified 2026-09-18)
+
+The lock is no longer *waited on*. `_exec_slot()` acquires `_shell_lock` with
+`acquire(blocking=False)` and raises `KernelBusy`, which the endpoints translate
+into **HTTP 409** carrying how long the in-flight call has been running and what
+it is running. `/kernel/status` reports `busy` / `busy_s` / `running` and — with
+`/kernel/interrupt` and `/kernel/get-output` — stays answerable during a run, so
+a bridge that looks dead now describes its own state and there is always a way
+out. Regression test: `tests/test_bridge.py::test_busy_request_fails_fast_with_409`
+(asserts a 409 in under 3 s while a 4 s run is in flight).
+
+This entry and §15 are the same defect seen from the two ends — the server held
+the lock forever, so the client's request queued behind it. Both are kept here
+because they were filed, and labelled, separately.
+
 ---
 
-## BUG-12: `kernel_stop` reports success but leaves the ipykernel child running
+## BUG-12: `kernel_stop` can leave processes behind — an orphaned bridge, and no process-group kill
 
-**Severity:** Medium (a live kernel that the tooling can no longer see, holding its ports)
-**File:** `extensions/index.ts` (`kernel_stop` handler / the stop sequence)
-**Status:** Open — measured 2026-09-16
+**Severity:** Low (bounded — the leaked bridge reaps itself when pi exits)
+**File:** `extensions/index.ts` (`kernel_stop` handler, `stopBridge`)
+**Status:** Partly corrected 2026-09-18: the original headline symptom does **not**
+reproduce; a smaller real defect was found in its place
 
-### Symptom
+### Original report (2026-09-16) — not reproducible
 
 ```
 kernel_stop:  ✅ Kernel 'marie' stopped (PID 18714, graceful shutdown)
@@ -300,42 +356,146 @@ ps:           18730  1  .../python -m ipykernel -f /Users/johnjanecek/.ipy/kerne
 lsof -p 18730: LISTEN on 51516, 51517, 51518, 51520, 51521, 51522   (all five ZMQ ports)
 ```
 
-The registry entry is removed, so `kernel_list` no longer shows the kernel — but the **kernel process is still
-alive**, reparented to `PPID 1`, still bound to its ZMQ ports and still holding everything in its namespace
-(a live browser, in this project's case). Nothing short of `kill <child_pid>` clears it.
+The registry entry was removed, so `kernel_list` no longer showed the kernel —
+but the **ipykernel child was still alive**, reparented to `PPID 1` and holding
+its five ZMQ ports. It was attributed to the stop path killing the `uv` wrapper
+while the child went unsignalled (wrapper → child, and the child is not in the
+wrapper's process group once the wrapper is gone).
 
-### Cause
+### Re-test (2026-09-18): the ipykernel child is reaped on every path
 
-The kernel is started as `uv run --no-project --python <venv> --with ipykernel python -m ipykernel -f
-<kernel.json>`, i.e. **wrapper → child**. The stop path kills the tracked PID (the wrapper) when the graceful
-`shutdown_request` does not complete, and the child is never signalled. Killing the parent of a process that is
-not in the same process group does not take the child with it.
+Three stops, checking `ps` for the child afterwards:
+
+| Path | ipykernel child after stop |
+|---|---|
+| normal `kernel_stop` | reaped |
+| bridge killed first (stop respawns it), then stop | reaped |
+| **`uv` wrapper killed first** (child already reparented to `PPID 1`), then stop | reaped |
+
+The child survives the *wrapper*, but not *`kernel_stop`*, because the graceful
+path does not go through the wrapper at all: `kernelPost("/kernel/shutdown")` asks
+the bridge to send `shutdown_request` over the control channel, keyed by the
+**connection file**, and a bridge reaches a kernel whose wrapper is long gone.
+So the original symptom is not reachable by stopping a kernel.
+
+### What is still wrong
+
+1. **A bridge is orphaned by a stop whose bridge was already dead** — reproduced
+twice on 2026-09-18 (pids 97544, 98533). `kernelPost` respawns a bridge to reach
+the kernel; `stopBridge(meta)` then kills the **stale** `meta.bridge_pid`
+recorded at spawn time, so the *fresh* bridge survives, serving a kernel whose
+registry entry has just been deleted. It holds a port until pi exits — it carries
+`--parent-pid` + `--stdin-watch`, so it does reap itself then, which is why this
+is a bounded leak rather than a permanent orphan. This is the *normal* case after
+a pi restart, since every bridge reaps itself when its pi exits.
+   Fix: resolve the bridge's **current** pid at stop time (re-read `meta.json`),
+   not the pid captured when the kernel was started.
+2. **No process-group kill.** `d824342` added `process.kill(-savedPid)`;
+   `dbeb441`'s rewrite dropped it and nothing replaced it. Today the stop path
+   only ever signals a single wrapper pid, so the defence this entry used to
+   claim is not in the code.
+   Fix: `process.kill(-meta.kernel_pid, "SIGKILL")` — the spawn is `detached: true`,
+   so the child *is* a process-group leader — keeping the single-pid attempt as a
+   fallback.
+3. **No post-stop verification**, so any future leak is again reported as success.
+   Fix: after the kill, confirm nothing is LISTENING on the kernel's control or
+   shell ports (or matching the connection-file path) and only then print
+   "stopped".
 
 ### Why it matters
 
-* **Invisible leak.** The kernel keeps consuming memory and its ports; a later `kernel_start` of the same name
-  allocates *new* ports, so the orphan can live until reboot.
-* **Silent success.** "stopped (PID …, graceful shutdown)" is reported for a stop that did not happen. The
-  user's mental model ("that kernel is gone") becomes false.
-* It is the **same failure class** as the Windows node's `schtasks /end`, which ends the scheduled task's
-  wrapper and leaves the python child holding the node's fixed ports — recorded in AI-Studio
-  `WebScrapping/knowledge/windows-problems.md` §3.3. Two platforms, one mistake: kill the tree, not the handle.
+* **Silent success.** "stopped (PID …, graceful shutdown)" is reported for a stop
+  that left a process behind. The user's mental model ("that kernel is gone")
+  becomes false while something still holds a port.
+* **Invisible accumulation.** Each such stop leaves one bridge; nothing surfaces
+  it because the registry entry is deliberately gone.
+* It is the **same failure class** as the Windows node's `schtasks /end`, which
+  ends the scheduled task's wrapper and leaves the python child holding the
+  node's fixed ports — AI-Studio
+  `WebScrapping/knowledge/windows-problems.md` §3.3. Two platforms, one mistake:
+  kill the tree, not the handle.
 
-### Fix
+### Fix (corrected 2026-09-18)
 
-1. **Verify after stopping**: after the graceful attempt, check that no process is LISTENING on the kernel's
-   control/shell ports (or that no process matches the connection-file path) and only then report success.
-2. **Escalate to the tree**: `pkill -f "<kernel.json path>"` (or kill the process group if the wrapper is a
-   group leader) before removing the registry entry. Matching the **connection-file path** in the command line
-   is the reliable key — it is unique per kernel and present in the child's argv.
-3. **Report what was actually killed** (PIDs), and warn when a graceful shutdown did not take effect instead of
-   printing a success line.
-4. Cheap detection at startup: on `kernel_start`/`kernel_list`, look for orphaned `ipykernel -f <path>`
-   processes whose registry entry is gone and offer to reap them.
+The original fix list said `pkill -f "<kernel.json path>"`. Do **not** do that —
+it contradicts the hard-won rule that no pattern-based kill runs on this machine
+(a stray `pkill -9 -f "cat"` once matched 41 unrelated processes). Kill the
+process **group** by pid instead:
+
+1. **Verify after stopping**: after the graceful attempt, check that nothing is
+   LISTENING on the kernel's control/shell ports (or that no process matches the
+   connection-file path) and only then report success.
+2. **Kill the group, not the handle**: `process.kill(-pid)` with the single-pid
+   attempt as fallback.
+3. **Report what was actually killed** (PIDs), and warn when a graceful shutdown
+   did not take effect instead of printing a success line.
+4. Cheap detection at startup: on `kernel_start`/`kernel_list`, look for orphaned
+   `ipykernel -f <path>` processes whose registry entry is gone and offer to reap
+   them.
 
 ---
 
-## ~~BUG-10: Timeouts reported as "Cannot reach kernel bridge"~~ ✅ RESOLVED
+## ~~BUG-13: `pi` could not exit after starting a kernel — and a graceful quit killed the kernel~~ ✅ RESOLVED
+
+**Severity:** High for scripted use (an unattended `pi -p` run never returns)
+**File:** `extensions/index.ts` (`spawnKernel`, `spawnBridge`), `extensions/lib.ts` (`spawnDetached`)
+**Commits:** `7e00b97` (13a), `528a952` (13b)
+**Status:** RESOLVED 2026-09-18 (13a) / 2026-09-16 (13b)
+
+### 13a — the hang
+
+`pi -p "…call kernel_start…"` never exited: still running at 150 s and 400 s,
+while the same prompt doing no kernel work finished in ~20 s. Reproduced under a
+bounded re-test on 2026-09-18 — baseline prompt exit 0 in 26 s, `kernel_start`
+prompt **killed at the 90 s bound (exit 137)** with its answer already printed.
+
+**Cause:** the detached spawns used execa with `stdout: { file: … }` /
+`stderr: { file: … }`. That file-output stream is a referenced handle, so node's
+event loop stayed alive for the child's entire lifetime. `unref()` on the execa
+promise — added by `528a952`, whose message claimed it fixed this — never
+addressed it.
+
+Measured with a 5 s child:
+
+| Spawn shape | Parent alive for |
+|---|---|
+| execa + `{ file }` + `cleanup: false` + `unref()` | **5.08 s** (hangs for the child's life) |
+| `child_process.spawn` + stdio as an fd + `unref()` | **0.03 s** |
+
+A second hypothesis in the original write-up — "unref'ing only the child leaves
+the stdin pipe holding the loop" — did **not** survive measurement either: on
+Node v26.8.2 a referenced but unwritten stdin pipe does not hold the event loop by
+itself. The pipe unref is kept as insurance for older releases and is labelled as
+such in the code rather than claimed as the fix.
+
+**Fix:** both spawn sites go through `spawnDetached()` (in `lib.ts`, so it is
+testable): `detached: true` (which is what execa's `cleanup: false` was really
+for), stdout/stderr written to an fd opened and closed in-process, then `unref()`
+on the child and on the stdin pipe when one is kept. The kernel spawn keeps no
+stdin pipe; the bridge keeps one, because `--stdin-watch` relies on EOF there.
+While in the same code path: the unchecked `pid as number` cast became a real null
+check, and a failed spawn now reports its actual cause instead of a bare
+"timed out waiting for the kernel connection file" (the same mask-the-cause shape
+as `034e095`).
+
+**Verified:** typecheck clean; unit 15/15 (three new: the regression test plus two
+controls that fail on the pre-fix shapes); bridge 15/15; `pi -p` exits 0 in 20 s;
+the kernel survives the exit; the bridge reaps itself; a fresh session reconnects
+to that kernel and evaluates. The regression test lives in `tests/lib.test.ts`
+with the fixture at `tests/fixtures/detached-fanout.ts`.
+
+### 13b — the kernels were being killed instead
+
+execa's `cleanup` defaults to **true**, installing a parent-exit hook that killed
+the kernels whenever pi exited gracefully — which would have made "kernels
+outlive the session" false on any clean `/quit`. It only appeared to work when pi
+was killed hard enough to skip the hook. Fixed by `cleanup: false` in `528a952`,
+and honoured now by `detached: true` with no exit-time kill at all. This half of
+that commit was a genuine fix; only its `unref()` claim was not.
+
+---
+
+## ~~BUG-14: Timeouts reported as "Cannot reach kernel bridge"~~ ✅ RESOLVED
 
 **Severity:** High — a misdiagnosis that sends the agent to restart a *healthy* bridge  
 **File:** `extensions/index.ts` (`kernelPost` / `kernelGet` catch blocks)
@@ -358,13 +518,13 @@ restart it, which destroys exactly the state the kernel exists to hold. This cos
 
 ---
 
-## ~~BUG-11: Requests silently queued behind a busy kernel~~ ✅ RESOLVED
+## ~~BUG-15: Requests silently queued behind a busy kernel~~ ✅ RESOLVED
 
 **Severity:** High — a busy kernel is indistinguishable from a dead bridge  
 **File:** `server/main.py` (lock acquisition in the execution helpers)
 
 `_shell_lock` serialized execution correctly, but a second request *waited* on it
-until the caller's own HTTP timeout expired — surfacing as BUG-10's bogus
+until the caller's own HTTP timeout expired — surfacing as BUG-14's bogus
 connectivity error. Observed live: after a single long `om.eval` timed out, even
 trivial calls failed until the in-flight work finished.
 
@@ -381,9 +541,9 @@ Regression test: `tests/test_bridge.py::test_busy_request_fails_fast_with_409`
 
 ---
 
-## ~~BUG-12: No bridge reaper — orphaned bridges leak ports forever~~ ✅ RESOLVED
+## ~~BUG-16: No bridge reaper — orphaned bridges leak ports forever~~ ✅ RESOLVED
 
-**Severity:** Medium — slow resource leak whose symptom mimics BUG-10  
+**Severity:** Medium — slow resource leak whose symptom mimics BUG-14  
 **File:** `extensions/index.ts` (`spawnBridge`), `server/main.py`
 
 Bridges were killed only by an explicit `kernel_stop` or a package reload. When a

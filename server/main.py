@@ -313,7 +313,7 @@ def _safe_log(message: str) -> None:
 
 
 def _watch_parent(pid: int, interval: float = 5.0) -> None:
-    """Exit when the process that owns this bridge disappears (BUG-10).
+    """Exit when the process that owns this bridge disappears (BUG-16).
 
     The bridge is launched through a `uv run` wrapper. When pi dies the wrapper
     can be reparented to init and keep running, so the bridge (and its port)
