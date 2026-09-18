@@ -5,6 +5,18 @@
 **Last verified:** 2026-09-18 on macOS 26 (Apple Silicon), pi 0.85.1, uv 0.12.15
 **Audience:** whoever is deploying this on a machine — human or agent
 
+**To have pi run this workflow:** point it at the file and say what "done" means. Every
+prerequisite below has a check and the document ends in completion criteria, so the run is
+auditable rather than a leap of faith:
+
+```bash
+pi -p "Read workflows/installs/001-install-pi-ipython-kernel.md and install pi-ipython-kernel on this machine, following its steps and reporting the completion criteria"
+```
+
+An agent should stop and ask rather than guess at two points: a missing `uv` on **pi's**
+PATH (it needs the launcher fixed, not a workaround), and any request to delete
+`~/.ipy/kernels/` while kernels are still running.
+
 Background and rationale live in the [README](../../README.md); this document is the
 procedure. Follow it in order; each step has a check, and the checks are the point.
 

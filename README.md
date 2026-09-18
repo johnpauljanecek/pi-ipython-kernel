@@ -48,6 +48,28 @@ Two halves, and only one of them is a package install:
 Nothing here needs a Python environment, a Jupyter install, or Node: the extension runs
 inside pi's own Node, and every Python dependency is provisioned by `uv` at first use.
 
+This section is the reference. The **executable version** — the same checks in order, each
+one pass/fail, plus failure modes, upgrade, and rollback — is
+[`workflows/installs/001-install-pi-ipython-kernel.md`](workflows/installs/001-install-pi-ipython-kernel.md).
+
+**Or have pi do it.** The workflow is written to be run by an agent: every prerequisite has
+a check and it ends in explicit completion criteria, so you can hand it over and audit the
+result.
+
+```bash
+# from a clone of this repo
+pi -p "Read workflows/installs/001-install-pi-ipython-kernel.md and install pi-ipython-kernel on this machine, following its steps and reporting the completion criteria"
+
+# or before you have the repo locally
+pi -p "Fetch https://raw.githubusercontent.com/johnpauljanecek/pi-ipython-kernel/main/workflows/installs/001-install-pi-ipython-kernel.md with curl, then follow it to install pi-ipython-kernel on this machine, reporting the completion criteria"
+```
+
+Then confirm the host yourself — this is the whole host check in one line:
+
+```bash
+command -v uv && uv --version
+```
+
 - **pi** — the host application that loads this extension. Verified compatible through
   pi 0.85.1.
 - **`uv` on `PATH`** — the only hard dependency. It must be visible to the environment
