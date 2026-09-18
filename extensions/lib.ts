@@ -6,6 +6,7 @@
  * Node builtins and `execa`.
  */
 import { execa } from "execa";
+import { spawn, type ChildProcess } from "child_process";
 import {
 	readFileSync,
 	writeFileSync,
@@ -14,6 +15,8 @@ import {
 	renameSync,
 	rmSync,
 	readdirSync,
+	openSync,
+	closeSync,
 } from "fs";
 import { resolve, join } from "path";
 import { homedir } from "os";
@@ -177,4 +180,77 @@ export function buildKernelCommand(python: string, kernelFile: string): string[]
 	}
 	// Version spec (e.g. "3.11"): no existing env — fresh --isolated env + ipykernel
 	return ["run", "--isolated", "--python", python, "--with", "ipykernel", "python", "-m", "ipykernel", "-f", kernelFile];
+}
+
+// ---------------------------------------------------------------------------
+// Detached spawning (BUG-13a)
+// ---------------------------------------------------------------------------
+
+export interface DetachedChild {
+	/** Child pid, or null when the spawn failed outright. */
+	pid: number | null;
+	/** Spawn failure or a non-zero exit, or null while the child looks healthy. */
+	failure: () => string | null;
+}
+
+/**
+ * Spawn a long-lived helper (kernel or bridge) that must outlive pi.
+ *
+ * Three properties are needed and each is load-bearing:
+ *
+ *  - `detached: true` puts the child in its own process group, so a signal
+ *    aimed at pi's group cannot reach the kernel and the child is not tied to
+ *    pi's lifetime. This is what execa's `cleanup: false` was for — its default
+ *    (`true`) installed a parent-exit hook that killed kernels on a graceful
+ *    quit, contradicting "kernels persist across sessions".
+ *  - stdout/stderr go to the log file as an **fd** (opened here, closed here).
+ *    execa's `stdout: { file: … }` instead built a *referenced* stream in this
+ *    process that held the event loop open for the child's whole lifetime, which
+ *    is why a scripted `pi -p` run that started a kernel never exited (BUG-13a).
+ *    Measured before/after: a 5 s child kept the parent alive 5.08 s with
+ *    execa `{ file }`; with this fd spawn the parent exits in ~0.03 s.
+ *  - `unref()` on the child, and on its stdin pipe when there is one. The child
+ *    handle must be unref'd or the loop never ends. The pipe unref is insurance
+ *    rather than the fix — measured on Node v26.8.2, a referenced but unwritten
+ *    stdin pipe does *not* hold the loop by itself (older releases did), and it
+ *    cannot simply be closed: the bridge keeps its read end as a liveness signal
+ *    (`--stdin-watch`), so EOF on it must mean "pi is gone", not "the spawn
+ *    helper returned".
+ */
+export function spawnDetached(
+	command: string,
+	args: string[],
+	opts: { cwd: string; logFile: string; keepStdinPipe?: boolean },
+): DetachedChild {
+	const logFd = openSync(opts.logFile, "a");
+	let failure: string | null = null;
+	let child: ChildProcess;
+	try {
+		child = spawn(command, args, {
+			cwd: opts.cwd,
+			detached: true,
+			stdio: [opts.keepStdinPipe ? "pipe" : "ignore", logFd, logFd],
+		});
+	} finally {
+		// The child holds its own dup of the fd; this copy is ours to close.
+		closeSync(logFd);
+	}
+
+	child.on("error", (err) => {
+		failure = errMsg(err);
+	});
+	child.on("exit", (code, signal) => {
+		if (failure === null && code !== 0) {
+			failure = signal ? `killed by signal ${signal}` : `exited with code ${code}`;
+		}
+	});
+
+	child.unref();
+	if (opts.keepStdinPipe) {
+		// A spawned stdin pipe is a Socket on POSIX and does have unref(); see the
+		// note above on why this is insurance rather than the fix.
+		(child.stdin as unknown as { unref?: () => void } | null)?.unref?.();
+	}
+
+	return { pid: child.pid ?? null, failure: () => failure };
 }

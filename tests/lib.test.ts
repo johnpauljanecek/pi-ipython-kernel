@@ -5,7 +5,10 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
+import { tmpdir } from "node:os";
 import {
 	buildKernelCommand,
 	deleteKernelDir,
@@ -150,4 +153,113 @@ test("kernelIsAlive: dead pid => false", async () => {
 test("findFreePort returns a valid ephemeral port", async () => {
 	const port = await findFreePort();
 	assert.ok(Number.isInteger(port) && port > 0 && port < 65536);
+});
+
+// ---------------------------------------------------------------------------
+// spawnDetached — BUG-13a: pi must be able to exit while its child lives on
+// ---------------------------------------------------------------------------
+
+const FIXTURE = join(dirname(fileURLToPath(import.meta.url)), "fixtures", "detached-fanout.ts");
+const FIXTURE_LOG = join(tmpdir(), `pi-ipython-kernel-fanout-${process.pid}.log`);
+
+function alive(pid: number | null): boolean {
+	if (!pid) return false;
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+function reap(pid: number | null): void {
+	if (!alive(pid)) return;
+	try {
+		process.kill(pid as number, "SIGKILL");
+	} catch {
+		/* already gone */
+	}
+}
+
+/** Start the fixture and resolve once it has printed its grandchild pid. */
+async function startFixture(mode: string): Promise<{
+	child: ChildProcess;
+	pid: number | null;
+	exited: Promise<{ code: number | null; signal: string | null }>;
+}> {
+	const child = spawn(process.execPath, [FIXTURE, mode, FIXTURE_LOG], { stdio: ["ignore", "pipe", "pipe"] });
+	const exited = new Promise<{ code: number | null; signal: string | null }>((resolve) => {
+		child.on("exit", (code, signal) => resolve({ code, signal }));
+	});
+
+	let buffered = "";
+	const firstLine = new Promise<string>((resolve, reject) => {
+		const timer = setTimeout(() => reject(new Error(`fixture '${mode}' printed nothing`)), 10_000);
+		child.stdout!.on("data", (chunk) => {
+			buffered += String(chunk);
+			const nl = buffered.indexOf("\n");
+			if (nl >= 0) {
+				clearTimeout(timer);
+				resolve(buffered.slice(0, nl));
+			}
+		});
+		child.on("exit", () => {
+			clearTimeout(timer);
+			reject(new Error(`fixture '${mode}' exited before printing its pid`));
+		});
+	});
+
+	const parsed = JSON.parse(await firstLine) as { pid: number | null };
+	return { child, pid: parsed.pid, exited };
+}
+
+/** Wait up to `ms`; resolves the exit result, or null if still running. */
+async function exitedWithin(
+	exited: Promise<{ code: number | null; signal: string | null }>,
+	ms: number,
+): Promise<{ code: number | null; signal: string | null } | null> {
+	return Promise.race([exited, new Promise<null>((resolve) => setTimeout(() => resolve(null), ms))]);
+}
+
+test("spawnDetached: the parent exits on its own while the child keeps running (BUG-13a)", async () => {
+	const { child, pid, exited } = await startFixture("unref");
+	try {
+		const result = await exitedWithin(exited, 10_000);
+		assert.notEqual(result, null, "fixture must exit without being killed — an un-unref'd handle kept the loop alive");
+		assert.equal(result!.code, 0, `fixture should exit cleanly, got ${JSON.stringify(result)}`);
+		assert.ok(pid, "fixture reported a grandchild pid");
+		assert.equal(alive(pid), true, "the detached child must still be running after the parent exited");
+	} finally {
+		child.kill("SIGKILL");
+		reap(pid);
+	}
+});
+
+test("spawnDetached control: an un-unref'd child keeps the parent alive (the pre-fix shape)", async () => {
+	const { child, pid, exited } = await startFixture("noref");
+	try {
+		const result = await exitedWithin(exited, 2500);
+		assert.equal(result, null, "without unref() the fixture must still be hanging — otherwise this test proves nothing");
+		assert.equal(alive(pid), true);
+	} finally {
+		child.kill("SIGKILL");
+		reap(pid);
+	}
+});
+
+test("spawnDetached control: the pre-fix execa `stdout: { file }` shape keeps the parent alive", async () => {
+	// This is the historical defect, reproduced: execa's file-output stream is a
+	// referenced handle, so `pi -p` stayed alive for the child's whole lifetime
+	// even though the child itself was unref'd. Measured on the pre-fix code:
+	// a 5 s child kept the parent alive 5.08 s; the fd-based spawn above exits
+	// in ~0.03 s.
+	const { child, pid, exited } = await startFixture("execa-file");
+	try {
+		const result = await exitedWithin(exited, 2500);
+		assert.equal(result, null, "execa {file: …} must still be hanging — otherwise this control proves nothing");
+		assert.equal(alive(pid), true);
+	} finally {
+		child.kill("SIGKILL");
+		reap(pid);
+	}
 });

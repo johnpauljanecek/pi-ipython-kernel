@@ -24,7 +24,6 @@
 
 import { defineTool, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { execa } from "execa";
 import { readFileSync, existsSync, mkdirSync, writeFileSync, chmodSync } from "fs";
 import { resolve, join, basename } from "path";
 import { homedir } from "os";
@@ -43,8 +42,10 @@ import {
 	procStartTime,
 	readMeta,
 	slugify,
+	spawnDetached,
 	writeMeta,
 	KERNELS_DIR,
+	type DetachedChild,
 	type KernelMeta,
 } from "./lib";
 
@@ -199,28 +200,13 @@ async function waitForHealth(port: number, timeoutMs: number): Promise<void> {
 // Spawn helpers (detached, file-logged)
 // ---------------------------------------------------------------------------
 
-function spawnKernel(kernelFile: string, python: string, cwd: string, logFile: string): ReturnType<typeof execa> {
-	const proc = execa("uv", buildKernelCommand(python, kernelFile), {
-		cwd,
-		detached: true,
-		// BUG-13: `cleanup` (default true) kills children when pi exits, which
-		// would make "kernels outlive the session" false on any graceful quit —
-		// it only appeared to work when pi was killed hard enough to skip it.
-		cleanup: false,
-		stdout: { file: logFile },
-		stderr: { file: logFile },
-	});
-	// Let pi exit: an un-unref'd child handle keeps node's event loop alive, so
-	// a scripted `pi -p` run that starts a kernel never terminates (observed:
-	// 10.6s without a kernel, still running after 400s with one).
-	proc.unref();
-	proc.catch(() => {
-		/* process exit tracked separately; errors surface via kernel.json / log */
-	});
-	return proc;
+function spawnKernel(kernelFile: string, python: string, cwd: string, logFile: string): DetachedChild {
+	// No stdin pipe: the kernel has no liveness contract with pi, and it must
+	// keep running after pi is gone.
+	return spawnDetached("uv", buildKernelCommand(python, kernelFile), { cwd, logFile });
 }
 
-function spawnBridge(name: string, kernelFile: string, port: number, token: string): ReturnType<typeof execa> {
+function spawnBridge(name: string, kernelFile: string, port: number, token: string): DetachedChild {
 	const args = [
 		"run",
 		"--with", "fastapi",
@@ -238,22 +224,13 @@ function spawnBridge(name: string, kernelFile: string, port: number, token: stri
 		"--parent-pid", String(process.pid),
 		"--stdin-watch",
 	];
-	const logFile = join(kernelDir(name), "bridge.log");
-	const proc = execa("uv", args, {
+	return spawnDetached("uv", args, {
 		cwd: getExtensionDir(),
-		detached: true,
-		// Same as the kernel: never kill the bridge from a parent exit hook, and
-		// never hold pi's event loop open. The bridge reaps itself instead — it
-		// watches this pi process and stdin (BUG-12).
-		cleanup: false,
-		stdout: { file: logFile },
-		stderr: { file: logFile },
+		logFile: join(kernelDir(name), "bridge.log"),
+		// EOF on this pipe is the bridge's death signal, so it must stay a pipe —
+		// spawnDetached unref's it rather than closing it (see the note there).
+		keepStdinPipe: true,
 	});
-	proc.unref();
-	proc.catch(() => {
-		/* bridge exit tracked via health checks */
-	});
-	return proc;
 }
 
 // ---------------------------------------------------------------------------
@@ -501,16 +478,28 @@ export default function (pi: ExtensionAPI) {
 				const kernelLog = join(dir, "kernel.log");
 
 				// Spawn kernel (detached, file-logged)
-				let spawnError: string | null = null;
 				const kernelProc = spawnKernel(kernelFile, python, workingDir, kernelLog);
-				kernelProc.catch((err) => {
-					spawnError = errMsg(err);
-				});
-				const pid = kernelProc.pid as number;
+				const pid = kernelProc.pid;
+				if (pid === null) {
+					throw new Error(
+						`Kernel process could not be started: ${kernelProc.failure() ?? "unknown spawn failure"}. Check ${kernelLog}`,
+					);
+				}
 				const startedAt = (await procStartTime(pid)) ?? "";
 
-				// Wait for the connection file, then confirm the process didn't die
-				await waitForKernelFile(kernelFile, KERNEL_FILE_TIMEOUT_MS);
+				// Wait for the connection file, then confirm the process didn't die.
+				// A failing spawn (uv missing, bad interpreter) reports its real cause
+				// here instead of surfacing as a bare "timed out waiting for kernel.json".
+				try {
+					await waitForKernelFile(kernelFile, KERNEL_FILE_TIMEOUT_MS);
+				} catch (err) {
+					const why = kernelProc.failure();
+					if (why) {
+						throw new Error(`Kernel process exited during startup: ${why}. Check ${kernelLog}`);
+					}
+					throw err;
+				}
+				const spawnError = kernelProc.failure();
 				if (spawnError) {
 					throw new Error(`Kernel process exited during startup: ${spawnError}. Check ${kernelLog}`);
 				}
