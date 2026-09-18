@@ -37,8 +37,10 @@ import {
 	findKernelByFile,
 	kernelDir,
 	kernelIsAlive,
+	killTree,
 	listKernelNames,
 	pidAlive,
+	pidsInGroup,
 	procStartTime,
 	readMeta,
 	slugify,
@@ -132,15 +134,22 @@ let connectedName: string | null = null;
 const bridgeStartPromises = new Map<string, Promise<number>>();
 
 async function stopBridge(meta: KernelMeta): Promise<void> {
-	// Graceful: /shutdown makes the actual python bridge os._exit(0). This is
-	// the reliable path because `meta.bridge_pid` is the `uv run` wrapper, which
-	// spawns the python bridge as a child — killing the wrapper alone would
-	// orphan the bridge. Always try /shutdown first.
-	if (await bridgeHealthy(meta.bridge_port)) {
+	// Re-read the registry first. A stop is frequently the *first* thing to touch
+	// a kernel whose bridge already reaped itself (that is the normal state after
+	// a pi restart), and `kernelPost` above may have just respawned one on a fresh
+	// port. Hard-killing the pid captured at spawn time therefore missed the very
+	// bridge this function exists to stop, leaving it holding a port while the
+	// registry entry was deleted (BUG-12, reproduced 2026-09-18).
+	const current = readMeta(meta.name) ?? meta;
+
+	// Graceful: /shutdown makes the actual python bridge os._exit(0). This is the
+	// reliable path because the tracked pid is the `uv run` wrapper, which spawns
+	// the python bridge as a child — killing the wrapper alone would orphan it.
+	if (current.bridge_port && (await bridgeHealthy(current.bridge_port))) {
 		try {
 			const headers: Record<string, string> = {};
-			if (meta.auth_token) headers["X-IPY-TOKEN"] = meta.auth_token;
-			await fetch(`http://127.0.0.1:${meta.bridge_port}/shutdown`, {
+			if (current.auth_token) headers["X-IPY-TOKEN"] = current.auth_token;
+			await fetch(`http://127.0.0.1:${current.bridge_port}/shutdown`, {
 				method: "POST",
 				headers,
 				signal: AbortSignal.timeout(CONTROL_TIMEOUT_MS),
@@ -150,10 +159,30 @@ async function stopBridge(meta: KernelMeta): Promise<void> {
 			/* bridge may already be gone */
 		}
 	}
-	// Fallback: hard-kill the uv wrapper (best effort)
-	if (meta.bridge_pid && pidAlive(meta.bridge_pid)) {
-		try { process.kill(meta.bridge_pid, "SIGKILL"); } catch { /* gone */ }
+	// Fallback: kill the bridge's whole process group (wrapper + python child).
+	if (current.bridge_pid && pidAlive(current.bridge_pid)) {
+		await killTree(current.bridge_pid);
 	}
+}
+
+/**
+ * What is still alive for a kernel that has just been told to stop?
+ *
+ * Checked by process group as well as by pid: the kernel runs as
+ * `uv run … python -m ipykernel`, so the group can outlive its leader, and a stop
+ * that leaves something behind must not be reported as a success (BUG-12).
+ */
+async function stopLeftovers(name: string, meta: KernelMeta): Promise<string[]> {
+	const left: string[] = [];
+	if (meta.kernel_pid > 0) {
+		const group = await pidsInGroup(meta.kernel_pid);
+		if (group.length) left.push(`kernel group (pids ${group.join(", ")})`);
+	}
+	const current = readMeta(name) ?? meta;
+	if (current.bridge_pid && pidAlive(current.bridge_pid)) {
+		left.push(`bridge (pid ${current.bridge_pid})`);
+	}
+	return left;
 }
 
 async function bridgeHealthy(port: number): Promise<boolean> {
@@ -974,16 +1003,42 @@ export default function (pi: ExtensionAPI) {
 				// Stop the bridge (graceful /shutdown first, then hard kill)
 				await stopBridge(meta);
 
-				// Kill the kernel only if still alive and identity-verified
+				// Escalate to the whole process group, not just the wrapper: the kernel
+				// runs as `uv run … python -m ipykernel`, and killing the wrapper alone
+				// leaves the ipykernel child behind (BUG-12).
 				if (await kernelIsAlive(meta)) {
-					try { process.kill(meta.kernel_pid, "SIGKILL"); } catch { /* gone */ }
+					await killTree(meta.kernel_pid);
+				}
+
+				// Verify before claiming success. SIGKILL is not instant, and the old
+				// code deleted the registry entry and printed "stopped" whether or not
+				// anything had actually stopped — which is how a live process became
+				// invisible to the tooling that was supposed to own it.
+				let leftover: string[] = [];
+				for (let i = 0; i < 20; i++) {
+					leftover = await stopLeftovers(name, meta);
+					if (!leftover.length) break;
+					await sleep(150);
+				}
+				if (leftover.length) {
+					// Keep the registry entry: it is the only handle left to retry with,
+					// and deleting it is precisely what hid this failure before.
+					return {
+						content: [
+							{
+								type: "text",
+								text: `⚠️ Kernel '${name}' did not stop cleanly — still alive: ${leftover.join(", ")}.\n\nThe registry entry was kept so this can be retried. Verify with \`ps -o pid=,pgid= -p <pid>\`, then \`kernel_stop ${name}\` again.`,
+							},
+						],
+						details: { name, stopped: false, leftovers: leftover, kernel_pid: meta.kernel_pid },
+					};
 				}
 
 				deleteKernelDir(name);
 				if (connectedName === name) connectedName = null;
 				return {
-					content: [{ type: "text", text: `✅ Kernel '${name}' stopped (PID ${meta.kernel_pid}, ${method})` }],
-					details: { name, pid: meta.kernel_pid, method },
+					content: [{ type: "text", text: `✅ Kernel '${name}' stopped (PID ${meta.kernel_pid}, ${method}; no processes left)` }],
+					details: { name, pid: meta.kernel_pid, method, stopped: true },
 				};
 			} catch (err) {
 				throw new Error(`❌ ${errMsg(err)}`);

@@ -146,6 +146,62 @@ export async function kernelIsAlive(meta: KernelMeta): Promise<boolean> {
 	return nowStart === meta.started_at;
 }
 
+/** Is this pid the leader of its own process group (i.e. safe to signal as `-pid`)? */
+export async function isGroupLeader(pid: number): Promise<boolean> {
+	if (!Number.isInteger(pid) || pid <= 0) return false;
+	const { stdout } = await execa("ps", ["-o", "pgid=", "-p", String(pid)], { reject: false });
+	return Number(String(stdout ?? "").trim()) === pid;
+}
+
+/** Pids still alive in a process group, excluding this process. */
+export async function pidsInGroup(pgid: number): Promise<number[]> {
+	if (!Number.isInteger(pgid) || pgid <= 0) return [];
+	const { stdout } = await execa("ps", ["-eo", "pid=,pgid="], { reject: false });
+	const found: number[] = [];
+	for (const line of String(stdout ?? "").split("\n")) {
+		const [pidText, groupText] = line.trim().split(/\s+/);
+		const pid = Number(pidText);
+		if (Number(groupText) !== pgid) continue;
+		if (Number.isFinite(pid) && pid !== process.pid) found.push(pid);
+	}
+	return found;
+}
+
+export interface KillResult {
+	pid: number;
+	signal: string;
+	/** true when the whole process group was signalled, false when only the pid was */
+	group: boolean;
+}
+
+/**
+ * SIGKILL a whole process group, falling back to the single pid.
+ *
+ * Kernels and bridges are spawned `detached: true`, so the child is its own group
+ * leader and its group id equals its pid — `kill(-pid)` therefore reaches the `uv`
+ * wrapper *and* the python process underneath it. Killing only the wrapper is what
+ * left ipykernel children reparented to `PPID 1` (BUG-12).
+ *
+ * The group is only targeted after confirming the pid really is a group leader:
+ * process groups are keyed by a leader's pid, so signalling `-pid` on a recycled
+ * pid could reach an unrelated group. When it is not a leader, only the pid is
+ * signalled.
+ *
+ * Returns null when there was nothing to kill.
+ */
+export async function killTree(pid: number | null, signal: NodeJS.Signals = "SIGKILL"): Promise<KillResult | null> {
+	if (!pid || !pidAlive(pid)) return null;
+	const leader = await isGroupLeader(pid);
+	try {
+		process.kill(leader ? -pid : pid, signal);
+		return { pid, signal, group: leader };
+	} catch (err) {
+		if (!leader) throw err;
+		process.kill(pid, signal);
+		return { pid, signal, group: false };
+	}
+}
+
 export function findFreePort(): Promise<number> {
 	return new Promise((res, rej) => {
 		const srv = createServer();

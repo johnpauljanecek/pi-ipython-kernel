@@ -15,9 +15,12 @@ import {
 	expandUser,
 	findFreePort,
 	findKernelByFile,
+	isGroupLeader,
 	kernelIsAlive,
+	killTree,
 	listKernelNames,
 	pidAlive,
+	pidsInGroup,
 	procStartTime,
 	readMeta,
 	slugify,
@@ -262,4 +265,112 @@ test("spawnDetached control: the pre-fix execa `stdout: { file }` shape keeps th
 		child.kill("SIGKILL");
 		reap(pid);
 	}
+});
+
+// ---------------------------------------------------------------------------
+// killTree / pidsInGroup — BUG-12: kill the group, not the handle
+// ---------------------------------------------------------------------------
+
+async function waitUntil(pred: () => boolean, ms: number): Promise<boolean> {
+	const deadline = Date.now() + ms;
+	while (Date.now() < deadline) {
+		if (pred()) return true;
+		await new Promise((r) => setTimeout(r, 50));
+	}
+	return pred();
+}
+
+function spawnSleep(seconds: number, detached: boolean): ChildProcess {
+	return spawn("sleep", [String(seconds)], { detached, stdio: ["ignore", "ignore", "ignore"] });
+}
+
+function killAll(...procs: ChildProcess[]): void {
+	for (const p of procs) {
+		try {
+			p.kill("SIGKILL");
+		} catch {
+			/* already gone */
+		}
+	}
+}
+
+test("isGroupLeader: true for a detached spawn, false for a child sharing our group", async () => {
+	const detached = spawnSleep(30, true);
+	const inOurGroup = spawnSleep(30, false);
+	try {
+		assert.equal(await isGroupLeader(detached.pid!), true, "detached children lead their own group");
+		assert.equal(
+			await isGroupLeader(inOurGroup.pid!),
+			false,
+			"a non-detached child stays in this process's group — signalling -pid would hit us",
+		);
+	} finally {
+		killAll(detached, inOurGroup);
+	}
+});
+
+test("killTree reaps a detached leader and the grandchild under it (the kernel's shape)", async () => {
+	// uv wrapper -> python child, in miniature: a detached leader with a child of
+	// its own. Killing only the leader is exactly what left ipykernel orphaned.
+	const script = [
+		'const { spawn } = require("child_process");',
+		'const kid = spawn(process.execPath, ["-e", "setTimeout(()=>{},60000)"], { stdio: "ignore" });',
+		'process.stdout.write(String(kid.pid) + "\\n");',
+		"setTimeout(() => {}, 60000);",
+	].join("\n");
+	const leader = spawn(process.execPath, ["-e", script], {
+		detached: true,
+		stdio: ["ignore", "pipe", "ignore"],
+	});
+	let grandchild: number | null = null;
+	try {
+		grandchild = await new Promise<number>((resolve, reject) => {
+			const timer = setTimeout(() => reject(new Error("leader never reported its child")), 10_000);
+			let buffered = "";
+			leader.stdout!.on("data", (chunk) => {
+				buffered += String(chunk);
+				const nl = buffered.indexOf("\n");
+				if (nl >= 0) {
+					clearTimeout(timer);
+					resolve(Number(buffered.slice(0, nl)));
+				}
+			});
+		});
+
+		const group = await pidsInGroup(leader.pid!);
+		assert.ok(group.includes(leader.pid!), "the leader is in its own group");
+		assert.ok(group.includes(grandchild), `the group must include the grandchild, got [${group.join(", ")}]`);
+
+		const result = await killTree(leader.pid!);
+		assert.equal(result?.group, true, "a detached leader must be signalled as a group");
+
+		assert.equal(await waitUntil(() => !alive(leader.pid) && !alive(grandchild), 3000), true);
+		assert.equal(alive(grandchild), false, "the grandchild must go with the group, not survive as an orphan");
+		assert.deepEqual(await pidsInGroup(leader.pid!), [], "no members may be left in the group");
+	} finally {
+		reap(leader.pid);
+		reap(grandchild);
+	}
+});
+
+test("killTree on a non-leader signals only that pid, never the shared process group", async () => {
+	// The guard that matters: process groups are keyed by a leader's pid, so a
+	// recycled pid could name an unrelated group. A bystander in our own group
+	// proves the group was left alone.
+	const victim = spawnSleep(30, false);
+	const bystander = spawnSleep(30, false);
+	try {
+		const result = await killTree(victim.pid!);
+		assert.equal(result?.group, false, "a non-leader is signalled by pid only");
+		assert.equal(await waitUntil(() => !alive(victim.pid), 2000), true);
+		assert.equal(alive(victim.pid), false);
+		assert.equal(alive(bystander.pid), true, "a sibling in the same group must survive");
+	} finally {
+		killAll(victim, bystander);
+	}
+});
+
+test("killTree returns null when there is nothing to kill", async () => {
+	assert.equal(await killTree(null), null);
+	assert.equal(await killTree(999_999_999), null);
 });
