@@ -7,7 +7,12 @@ shared) wrapping `jupyter_client.BlockingKernelClient`, registered under
 
 ## Installation
 
-Install as a Pi package:
+**The host comes first.** The extension needs a POSIX system (macOS/Linux) and `uv`
+visible to the environment pi was launched from — no Python, Node, or Jupyter of your own.
+The full host checklist (uv install + verification, writable directories, loopback, what uv
+downloads on first run) is in [Part 1 of the main README](../README.md#part-1--the-host).
+
+Then install the package:
 
 ```bash
 pi install /path/to/pi-ipython-kernel
@@ -17,6 +22,12 @@ Or from npm (once published):
 
 ```bash
 pi install npm:pi-ipython-kernel
+```
+
+Check the host in one line before blaming the extension:
+
+```bash
+command -v uv && uv --version
 ```
 
 ## Tools

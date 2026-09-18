@@ -36,26 +36,152 @@ workflow where re-running setup on every step is the bottleneck.
 
 ## Installation
 
-### From npm (once published)
+Two halves, and only one of them is a package install:
+
+| Half | What it is | Installed |
+|---|---|---|
+| **Host** | a POSIX userland plus `uv` on `PATH` — no Python, no Node, no Jupyter | once per machine (Part 1) |
+| **Extension** | the 10 kernel tools pi loads | per pi profile (Part 2) |
+
+### Part 1 — the host
+
+Nothing here needs a Python environment, a Jupyter install, or Node: the extension runs
+inside pi's own Node, and every Python dependency is provisioned by `uv` at first use.
+
+- **pi** — the host application that loads this extension. Verified compatible through
+  pi 0.85.1.
+- **`uv` on `PATH`** — the only hard dependency. It must be visible to the environment
+  *pi was launched from*, not merely to an interactive shell:
+
+  ```bash
+  command -v uv && uv --version    # must resolve, e.g. uv 0.12.15
+  ```
+
+  Install with `brew install uv` (macOS), `curl -LsSf https://astral.sh/uv/install.sh | sh`,
+  or the [uv docs](https://docs.astral.sh/uv/). A pi started from a GUI, an IDE task, or a
+  different login shell can see a different `PATH` — that is the most common host-side
+  failure, and it surfaces as `Kernel process exited during startup: … uv …`.
+- **A POSIX-style OS with `ps` and `kill`** — macOS or Linux. Used for the PID guards
+  (`ps -o lstart= -p <pid>`, `ps -o pgid= -p <pid>`), process-group kills, and the
+  `SIGKILL` stop paths. No GNU-only long options are used, so BSD and GNU userlands both
+  work.
+- **A writable extension directory.** The bridge is started with `uv run` *inside the
+  package directory*, which contains a `pyproject.toml`, so uv creates `.venv/` there on
+  the first bridge start (≈95 MB: fastapi, uvicorn, jupyter-client, ipykernel,
+  jupyter-console, pydantic, pyzmq). Where that is depends on how you installed it:
+
+  | Install | Package directory |
+  |---|---|
+  | `pi install git:…` | `~/.pi/agent/git/<host>/<path>` (project installs: `.pi/git/<host>/<path>`) |
+  | `pi install npm:…` | `~/.pi/agent/npm/` (project installs: `.pi/npm/`) |
+  | `pi install /local/path` | the path you named |
+  | `pi -e …` | a **temporary directory**, discarded at the end of the run |
+
+  None of these may be read-only. The `-e` case is worth knowing about: it re-provisions
+  into a fresh temp directory every run, so it is a way to *try* the extension, not to use
+  it daily.
+- **A writable `~/.ipy/kernels/`** — the registry, created on demand: `kernel.json`,
+  `meta.json`, `kernel.log`, `bridge.log`, plus `console.sh` written by `kernel_console_cmd`.
+- **Loopback networking** — each bridge binds `127.0.0.1` on a free ephemeral port. No
+  inbound firewall rule, no external exposure, nothing to open.
+- **Disk and network for the first run** — uv downloads the tool env and interpreters into
+  `~/.cache/uv` (cache), `~/.local/share/uv/tools` (tool envs, ≈320 MB for the IPython tool
+  on one populated machine), and `~/.local/share/uv/python` (interpreters). Afterwards,
+  starts are local and near-instant. Those sizes are observations, not a floor.
+- **Optional** — `jupyter-console` in the *kernel's* environment, only for the
+  `kernel_console_cmd` handoff; a `cfg.json` in the package root (see `cfg.json.example`).
+- **Windows is not supported and there are no plans to port it** — the author has no
+  Windows machine. Blockers: `detached` process-group semantics, `SIGKILL` stop paths, and
+  the PID start-time guard are all POSIX-specific. The bridge, jupyter_client and ipykernel
+  are themselves Windows-capable, so a port would be a moderate effort limited to process
+  management.
+
+How uv is invoked (all four interpreter modes, always through uv):
+
+| `python` setting | Command |
+|---|---|
+| `""` (default) | `uv tool run --from ipython --with ipykernel python -m ipykernel -f <file>` |
+| `"project"` | `uv run --with ipykernel python -m ipykernel -f <file>` |
+| `"3.11"` (version) | `uv run --isolated --python 3.11 --with ipykernel python -m ipykernel -f <file>` |
+| `"/path/to/.venv"` | `uv run --no-project --python <path> --with ipykernel python -m ipykernel -f <file>` |
+| bridge (always) | `uv run --with fastapi --with uvicorn --with jupyter_client --with pyzmq --with pydantic python server/main.py …` |
+
+**Pre-warm the host** (optional — makes the first `kernel_start` fast). Run the two
+commands the extension will run itself, from the package directory:
+
 ```bash
-pi install npm:pi-ipython-kernel
+cd /path/to/pi-ipython-kernel    # for a git install: pi's extension directory
+uv run --with fastapi --with uvicorn --with jupyter_client --with pyzmq --with pydantic \
+  python -c "import fastapi, uvicorn, jupyter_client, zmq, pydantic; print('bridge deps ok')"
+uv tool run --from ipython --with ipykernel python -c "import ipykernel; print(ipykernel.__version__)"
 ```
 
-### From GitHub
+**One operational caution.** The PID-reuse guard records the kernel's start time as a
+string (`ps -o lstart=`) and compares that string later. A changed locale or timezone
+between sessions can make two readings of the same live process disagree; keep `LANG`/`TZ`
+stable for the pi profiles that own long-lived kernels. (Tracked as a parked defect in
+`workflows/open_bugs.md` follow-up work.)
+
+### Part 2 — the extension
+
 ```bash
-pi install git:github.com/johnpauljanecek/pi-ipython-kernel
+pi install npm:pi-ipython-kernel                                  # once published to npm
+pi install git:github.com/johnpauljanecek/pi-ipython-kernel       # from GitHub
+pi install /path/to/pi-ipython-kernel                            # from a local clone
 ```
 
-### From local path
-```bash
-pi install /path/to/pi-ipython-kernel
-```
+Try it without installing anything:
 
-### Try without installing
 ```bash
-pi -e npm:pi-ipython-kernel
 pi -e git:github.com/johnpauljanecek/pi-ipython-kernel
 ```
+
+`-e` installs into a temporary directory for that run only, and every run provisions a
+fresh copy — fine for a look, wasteful as a daily driver. Install it instead.
+
+**Verify the install.** In pi:
+
+```
+kernel_status                              # "no kernel connected" + registry summary
+kernel_start { "name": "smoke" }
+kernel_run_python { "code": "print(2 + 2)" }
+kernel_stop { "name": "smoke" }
+```
+
+`kernel_stop` waits for the process group to disappear before reporting success, so a
+clean run ends with `no processes left`. If it instead says *"did not stop cleanly — still
+alive: …"*, the registry entry is deliberately kept so the stop can be retried — see
+`kernel_status` and the pid it names.
+
+### Uninstall and cleanup
+
+Stop the kernels first — they are detached and outlive pi by design:
+
+```
+kernel_list
+kernel_stop { "name": "<name>" }        # repeat per kernel
+```
+
+```bash
+pi remove pi-ipython-kernel              # or: pi remove git:github.com/johnpauljanecek/pi-ipython-kernel
+rm -rf ~/.ipy/kernels                    # registry — only once no kernels remain
+```
+
+Removing the extension does **not** stop running kernels. A kernel's bridge dies when its
+owning pi exits, but the kernel does not:
+
+```bash
+pgrep -fl "ipykernel -f"                 # list first, never kill by pattern
+```
+
+Then stop each one from a pi with the extension loaded (`kernel_stop { "name": … }`), or by
+explicit pid. Deleting `~/.ipy/kernels/` while a kernel is alive only makes it harder to
+find — the process keeps its ports and state.
+
+Dev-only requirements (not needed to run the extension):
+
+- Node ≥ 22.6 for `npm test` (native TS type-stripping); TypeScript for `npm run typecheck`.
+- `uv sync --group dev` once, for `npm run test:bridge` (pytest).
 
 ## Tools
 
@@ -187,25 +313,10 @@ User preferences live in `cfg.json` in the package root (see `cfg.json.example`)
 
 ## Requirements
 
-As of now:
-
-- **pi** (the coding agent) — the host application that loads this extension. Verified compatible through pi 0.85.1.
-- **`uv`** available in `PATH` — the only hard dependency. Nothing else is installed by hand:
-  - Default interpreter: `uv tool run --from ipython --with ipykernel python -m ipykernel …` (uv fetches IPython + ipykernel into its tool env on first start).
-  - `"python": "project"`: `uv run --with ipykernel …` inside the project's env.
-  - Version spec or venv path (e.g. `"3.11"`, a `.venv` path): `uv run --no-project --python <spec> --with ipykernel …`.
-  - The bridge self-provisions (`uv run --with fastapi --with uvicorn --with jupyter_client --with pyzmq --with pydantic …`); no `.venv` required.
-- A POSIX-style OS. **Windows is not supported and there are no plans to port it** — the author has no Windows machine. Blockers: `detached` process-group semantics, `SIGKILL`-based stop paths, and the PID start-time guard are all POSIX-specific (the bridge, jupyter_client, and ipykernel themselves are Windows-capable, so a port would be a moderate effort limited to process management).
-- Writable `~/.ipy/kernels/` (the registry) and loopback networking (the bridge binds `127.0.0.1` on a free port).
-- Optional: `jupyter-console` in the kernel's environment, only for `kernel_console_cmd` interactive handoff.
-- Optional: a `cfg.json` in the package root (see `cfg.json.example`); without one, sane defaults apply.
-
-Note: the first `kernel_start` on a fresh machine is slower while uv downloads IPython/ipykernel/FastAPI into its cache; subsequent starts are near-instant.
-
-Dev-only requirements (not needed to run the extension):
-
-- Node ≥ 22.6 for `npm test` (native TS); TypeScript for `npm run typecheck`.
-- `uv sync --group dev` once, for `npm run test:bridge` (pytest).
+See **Installation → Part 1 — the host** above for the full list and how to verify each
+item. Short version: pi ≥ 0.85.1; `uv` visible to pi's environment; a POSIX OS with `ps`
+and `kill`; a writable extension directory and `~/.ipy/kernels/`; loopback networking.
+Dev-only, for the test suites: Node ≥ 22.6 and `uv sync --group dev`.
 
 ## Testing
 
@@ -214,8 +325,11 @@ Two suites cover the bridge and the extension's pure logic.
 ### Node — extension logic (`npm test`)
 
 Unit tests for the pure helpers in `extensions/lib.ts`: the `kernel_start`
-spawn-command matrix, registry read/write/list/find, and PID liveness (including
-the start-time guard that prevents signaling a recycled PID).
+spawn-command matrix, registry read/write/list/find, PID liveness (including the
+start-time guard that prevents signaling a recycled PID), detached spawning (that
+it does not hold pi's event loop open, with pre-fix controls), and process-group
+kills (`killTree` reaps a leader and its grandchild; a non-leader is signalled by
+pid only, so a sibling in the shared group survives).
 
 ```bash
 npm test          # node --test "tests/*.test.ts"  (Node >= 22.6 for native TS)
@@ -239,3 +353,4 @@ npm run test:bridge      # uv run pytest tests/test_bridge.py -v
 - [uv tool environment setup](docs/uv-tool-env-setup.md)
 - [Kitty remote control](docs/useful_kitty.md)
 - [ipy skill](skills/ipy/SKILL.md)
+- [Bug ledger](workflows/open_bugs.md) — every defect, with the commit that fixed it

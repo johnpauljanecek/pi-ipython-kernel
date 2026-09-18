@@ -163,9 +163,17 @@ Kernel state lives at `~/.ipy/kernels/<name>/`:
 
 ## Requirements
 
-- `uv` installed and available in PATH.
-- The bridge self-provisions its deps via `uv run --with fastapi --with uvicorn --with jupyter_client --with pyzmq --with pydantic` — no `.venv` needed.
-- Kernels use `uv` too: default `uv tool run --from ipython --with ipykernel …` (self-contained).
+Host side (README "Installation → Part 1 — the host" has the full checklist):
+
+- `uv` installed and available in **pi's** PATH — the only hard dependency.
+- A POSIX OS with `ps` and `kill` (macOS/Linux). Windows is not supported.
+- Writable extension directory and `~/.ipy/kernels/`; loopback networking.
+- Python packages are self-provisioned — nothing to install by hand: kernels use
+  `uv tool run --from ipython --with ipykernel …`, the bridge uses
+  `uv run --with fastapi --with uvicorn --with jupyter_client --with pyzmq --with pydantic …`.
+  uv builds/uses an env for each (a `.venv/` in the package directory for the bridge, a tool
+  env for the interpreter), so no venv is created manually — but the first run is slow while
+  uv downloads them, and a missing `uv` surfaces as the kernel exiting during startup.
 
 ## Error Handling
 
