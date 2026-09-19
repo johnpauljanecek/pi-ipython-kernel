@@ -227,7 +227,7 @@ pi install /path/to/pi-ipython-kernel
 ```
 
 The tool calls underneath look like this — you don't type them, you say what you want and pi
-picks them (see [`examples/`](examples/README.md) for a real session exported verbatim):
+picks them (see [`examples/`](examples/README.md) for a real session exported from pi's own session files):
 
 ```
 kernel_start { "name": "data" }

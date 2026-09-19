@@ -4,8 +4,8 @@ layout: default
 
 # pi-ipython-kernel
 
-Persistent IPython kernels for the [pi](https://github.com/earendil-works/pi-coding-agent)
-coding agent. Every kernel is a named resource with its own companion bridge process, and it
+Persistent IPython kernels for the [pi](https://github.com/earendil-works/pi) coding agent.
+Every kernel is a named resource with its own companion bridge process, and it
 outlives the pi session that started it — start one in one session, find your variables still
 there in the next.
 
@@ -40,8 +40,9 @@ first use.
 
 ## Documentation
 
-- [README](README.md) — why, install, tools, lifecycle, architecture, registry, configuration, testing
+- [README](https://github.com/johnpauljanecek/pi-ipython-kernel/blob/main/README.md) — why, install,
+  tools, lifecycle, architecture, registry, configuration, testing *(on GitHub: Pages serves
+  README-style files as raw markdown rather than rendering them)*
 - [Install workflow](workflows/installs/001-install-pi-ipython-kernel.md) — the same install as a
   checked, auditable procedure, written to be handed to an agent
-- [examples/](examples/README.md) — the two sessions above, and exactly what was changed before
-  committing them
+- [examples/](examples/) — the two sessions above, and exactly what was changed before committing them
