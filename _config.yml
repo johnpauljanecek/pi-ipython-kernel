@@ -1,0 +1,6 @@
+theme: jekyll-theme-cayman
+
+title: pi-ipython-kernel
+description: Persistent IPython kernels for the pi coding agent
+
+show_downloads: false
