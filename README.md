@@ -379,8 +379,11 @@ npm run test:bridge      # uv run pytest tests/test_bridge.py -v
 
 ## Documentation
 
+- **[Documentation site](https://johnpauljanecek.github.io/pi-ipython-kernel/)** — the two session demos
+  viewable in a browser, with the install workflow rendered beside them
 - [Install workflow](workflows/installs/001-install-pi-ipython-kernel.md) — the procedure to follow, with checks and rollback
-- [Example session](examples/README.md) — a real session exported verbatim
+- [Session demos](https://johnpauljanecek.github.io/pi-ipython-kernel/examples/) — real sessions exported
+  from pi's own session files (source: [`examples/`](examples/README.md))
 - [uv tool environment setup](docs/uv-tool-env-setup.md)
 - [Kitty remote control](docs/useful_kitty.md)
 - [ipy skill](skills/ipy/SKILL.md)
