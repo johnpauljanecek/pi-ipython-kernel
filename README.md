@@ -1,5 +1,7 @@
 # pi-ipython-kernel
 
+**Documentation site — <https://johnpauljanecek.github.io/pi-ipython-kernel/>** (the two session demos rendered in a browser, the install workflow, and a short overview)
+
 Pi extension for controlling IPython kernels via HTTP. Each kernel is a **persistent named resource** with its own companion FastAPI bridge (one per kernel) that wraps `jupyter_client.BlockingKernelClient`. Kernels live in `~/.ipy/kernels/<name>/` and outlive pi sessions.
 
 ## Why
