@@ -226,6 +226,9 @@ Dev-only requirements (not needed to run the extension):
 pi install /path/to/pi-ipython-kernel
 ```
 
+The tool calls underneath look like this — you don't type them, you say what you want and pi
+picks them (see [`examples/`](examples/README.md) for a real session exported verbatim):
+
 ```
 kernel_start { "name": "data" }
 kernel_run_python { "code": "print('hello from kernel')" }
@@ -233,6 +236,10 @@ kernel_eval_expr { "expr": "1 + 1" }
 kernel_list
 kernel_stop { "name": "data" }
 ```
+
+[`examples/session-02-reconnect-and-stop.jsonl`](examples/session-02-reconnect-and-stop.jsonl)
+is the one worth reading: a second pi process attaches to a kernel the first one started and
+finds the data still in memory.
 
 ## Lifecycle
 
@@ -373,6 +380,7 @@ npm run test:bridge      # uv run pytest tests/test_bridge.py -v
 ## Documentation
 
 - [Install workflow](workflows/installs/001-install-pi-ipython-kernel.md) — the procedure to follow, with checks and rollback
+- [Example session](examples/README.md) — a real session exported verbatim
 - [uv tool environment setup](docs/uv-tool-env-setup.md)
 - [Kitty remote control](docs/useful_kitty.md)
 - [ipy skill](skills/ipy/SKILL.md)
